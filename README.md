@@ -68,6 +68,10 @@ MYSQL_HOST=oempro_mysql
 MYSQL_ROOT_PASSWORD=your_root_password
 MYSQL_DATABASE=oempro
 
+# MySQL data directory on HOST (required for XtraBackup)
+# For Octeth Docker: /opt/oempro/_dockerfiles/mysql/data_v8
+MYSQL_DATA_DIR=/opt/oempro/_dockerfiles/mysql/data_v8
+
 # Backup Storage
 BACKUP_DIR=/var/backups/octeth
 
@@ -170,6 +174,8 @@ MYSQL_ROOT_PASSWORD=             # Root password (required)
 MYSQL_DATABASE=oempro            # Database name
 MYSQL_USERNAME=oempro            # MySQL user
 MYSQL_PASSWORD=                  # MySQL password
+MYSQL_DATA_DIR=                  # MySQL data directory on HOST (required)
+                                 # For Octeth: /opt/oempro/_dockerfiles/mysql/data_v8
 ```
 
 #### Backup Storage
