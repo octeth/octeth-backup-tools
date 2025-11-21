@@ -1,0 +1,19 @@
+# Sensitive configuration files
+config/.env
+config/backup.conf
+*.conf
+.env
+
+# Backup files (if testing locally)
+backups/
+*.xbstream
+*.gz
+*.log
+
+# Temporary files
+*.tmp
+*.lock
+.DS_Store
+
+# Logs
+logs/*.log

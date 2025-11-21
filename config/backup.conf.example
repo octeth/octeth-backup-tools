@@ -1,0 +1,93 @@
+# ============================================
+# Octeth Backup Tool - Main Configuration
+# ============================================
+# This file is sourced by backup scripts
+# Copy to backup.conf and customize as needed
+
+# Load environment variables from .env file
+if [ -f "$(dirname "$0")/../config/.env" ]; then
+    set -a
+    source "$(dirname "$0")/../config/.env"
+    set +a
+elif [ -f "/etc/octeth-backup/.env" ]; then
+    set -a
+    source "/etc/octeth-backup/.env"
+    set +a
+else
+    echo "Error: Configuration file not found"
+    exit 1
+fi
+
+# ============================================
+# Backup Naming Convention
+# ============================================
+# Format: octeth-backup-YYYY-MM-DD_HH-MM-SS
+# Example: octeth-backup-2025-01-15_02-00-00
+
+BACKUP_PREFIX="octeth-backup"
+DATE_FORMAT="%Y-%m-%d_%H-%M-%S"
+
+# ============================================
+# Backup Types and Directories
+# ============================================
+
+BACKUP_TYPE_DAILY="daily"
+BACKUP_TYPE_WEEKLY="weekly"
+BACKUP_TYPE_MONTHLY="monthly"
+
+DAILY_DIR="${BACKUP_DIR}/${BACKUP_TYPE_DAILY}"
+WEEKLY_DIR="${BACKUP_DIR}/${BACKUP_TYPE_WEEKLY}"
+MONTHLY_DIR="${BACKUP_DIR}/${BACKUP_TYPE_MONTHLY}"
+
+# ============================================
+# MySQL Container Access
+# ============================================
+
+# Docker exec command template
+DOCKER_EXEC="${DOCKER_CMD} exec ${MYSQL_HOST}"
+
+# MySQL client command inside container
+MYSQL_CMD="mysql -u${MYSQL_USERNAME} -p${MYSQL_PASSWORD} -h${MYSQL_HOST}"
+
+# XtraBackup command template
+XTRABACKUP_CMD="${XTRABACKUP_BIN} --backup --target-dir=%TARGET_DIR%"
+
+# ============================================
+# Health Check Settings
+# ============================================
+
+# Minimum free space required (in GB)
+MIN_FREE_SPACE_GB=10
+
+# MySQL connection timeout (seconds)
+MYSQL_CONNECT_TIMEOUT=10
+
+# ============================================
+# S3 Upload Settings
+# ============================================
+
+# AWS CLI command template
+AWS_CMD="aws s3 cp %SOURCE% s3://${S3_BUCKET}/${S3_PREFIX}/%DEST% --region ${S3_REGION} --storage-class ${S3_STORAGE_CLASS}"
+
+# rclone command template
+RCLONE_CMD="rclone copy %SOURCE% ${RCLONE_REMOTE}:${S3_BUCKET}/${S3_PREFIX}/%DEST%"
+
+# ============================================
+# Retention Policy Details
+# ============================================
+
+# Day of week for weekly backups (0=Sunday, 1=Monday, etc.)
+WEEKLY_DAY=0
+
+# Day of month for monthly backups (1-31)
+MONTHLY_DAY=1
+
+# ============================================
+# Notification Templates
+# ============================================
+
+EMAIL_SUBJECT_SUCCESS="[SUCCESS] Octeth Backup Completed"
+EMAIL_SUBJECT_FAILURE="[FAILURE] Octeth Backup Failed"
+
+WEBHOOK_PAYLOAD_SUCCESS='{"status":"success","message":"Octeth backup completed","timestamp":"%TIMESTAMP%","backup_size":"%SIZE%"}'
+WEBHOOK_PAYLOAD_FAILURE='{"status":"failure","message":"Octeth backup failed","timestamp":"%TIMESTAMP%","error":"%ERROR%"}'
