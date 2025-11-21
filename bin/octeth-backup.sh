@@ -46,7 +46,7 @@ log() {
     shift
     local message="$@"
     local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    echo "[${timestamp}] [${level}] ${message}" | tee -a "${LOG_FILE}"
+    echo "[${timestamp}] [${level}] ${message}" | tee -a "${LOG_FILE}" >&2
 }
 
 log_info() {
@@ -282,7 +282,7 @@ perform_backup() {
         --user=root \
         --password="${MYSQL_ROOT_PASSWORD}" \
         --parallel=${threads} \
-        ${XTRABACKUP_EXTRA_OPTS} 2>&1 | tee -a "${LOG_FILE}"; then
+        ${XTRABACKUP_EXTRA_OPTS} >> "${LOG_FILE}" 2>&1; then
         log_success "XtraBackup completed successfully"
     else
         log_error "XtraBackup failed"
@@ -294,7 +294,7 @@ perform_backup() {
     if [ "${VERIFY_BACKUP}" = "true" ]; then
         log_info "Preparing backup (applying transaction logs)"
 
-        if ${XTRABACKUP_BIN} --prepare --target-dir="${temp_backup_dir}" 2>&1 | tee -a "${LOG_FILE}"; then
+        if ${XTRABACKUP_BIN} --prepare --target-dir="${temp_backup_dir}" >> "${LOG_FILE}" 2>&1; then
             log_success "Backup prepared successfully (ready for restore)"
         else
             log_error "Backup prepare failed"
@@ -312,10 +312,12 @@ compress_backup() {
 
     log_info "Compressing backup with ${COMPRESSION_TOOL}"
 
-    local tar_cmd="tar cf - -C $(dirname ${source_dir}) $(basename ${source_dir})"
-    local compress_cmd="${COMPRESSION_TOOL} -${COMPRESSION_LEVEL}"
+    # Get parent directory and backup directory name
+    local parent_dir=$(dirname "${source_dir}")
+    local backup_dirname=$(basename "${source_dir}")
 
-    if ${tar_cmd} | ${compress_cmd} > "${dest_file}"; then
+    # Compress backup using tar and pigz/gzip
+    if tar -cf - -C "${parent_dir}" "${backup_dirname}" | ${COMPRESSION_TOOL} -${COMPRESSION_LEVEL} > "${dest_file}"; then
         log_success "Backup compressed: ${dest_file}"
 
         # Calculate size
