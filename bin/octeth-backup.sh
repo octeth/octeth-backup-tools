@@ -123,24 +123,47 @@ check_xtrabackup() {
 check_disk_space() {
     local backup_dir_parent=$(dirname "${BACKUP_DIR}")
 
-    # Create backup directory if it doesn't exist
+    # Create backup and temp directories if they don't exist
     mkdir -p "${BACKUP_DIR}"
+    mkdir -p "${TEMP_DIR}"
 
-    # Check disk usage
+    # Check disk usage for backup directory
     local disk_usage=$(df -h "${backup_dir_parent}" | awk 'NR==2 {print $5}' | sed 's/%//')
     local free_space_gb=$(df -BG "${backup_dir_parent}" | awk 'NR==2 {print $4}' | sed 's/G//')
 
     if [ "$disk_usage" -gt "$MAX_DISK_USAGE" ]; then
-        log_error "Disk usage is ${disk_usage}% (threshold: ${MAX_DISK_USAGE}%)"
+        log_error "Backup directory disk usage is ${disk_usage}% (threshold: ${MAX_DISK_USAGE}%)"
         exit 1
     fi
 
     if [ "$free_space_gb" -lt "$MIN_FREE_SPACE_GB" ]; then
-        log_error "Free space is ${free_space_gb}GB (minimum required: ${MIN_FREE_SPACE_GB}GB)"
+        log_error "Backup directory free space is ${free_space_gb}GB (minimum required: ${MIN_FREE_SPACE_GB}GB)"
         exit 1
     fi
 
-    log_info "Disk check passed: ${free_space_gb}GB free, ${disk_usage}% used"
+    log_info "Backup directory disk check passed: ${free_space_gb}GB free, ${disk_usage}% used"
+
+    # Check disk space for temp directory (critical for XtraBackup)
+    local temp_disk_usage=$(df -h "${TEMP_DIR}" | awk 'NR==2 {print $5}' | sed 's/%//')
+    local temp_free_space_gb=$(df -BG "${TEMP_DIR}" | awk 'NR==2 {print $4}' | sed 's/G//')
+
+    # Estimate required space (database size + 20% buffer)
+    if [ -d "${MYSQL_DATA_DIR}" ]; then
+        local db_size_gb=$(du -sb "${MYSQL_DATA_DIR}" 2>/dev/null | awk '{print int($1/1024/1024/1024)}')
+        local required_space=$((db_size_gb + db_size_gb / 5 + 5))  # DB size + 20% + 5GB buffer
+
+        log_info "Database size: ~${db_size_gb}GB, temp directory has ${temp_free_space_gb}GB free"
+
+        if [ "$temp_free_space_gb" -lt "$required_space" ]; then
+            log_error "Insufficient space in temp directory!"
+            log_error "Required: ~${required_space}GB, Available: ${temp_free_space_gb}GB"
+            log_error "Please increase TEMP_DIR space or set TEMP_DIR to a location with more space"
+            log_error "Recommended: TEMP_DIR=/var/backups/octeth/tmp (same disk as backups)"
+            exit 1
+        fi
+    fi
+
+    log_info "Temp directory disk check passed: ${temp_free_space_gb}GB free, ${temp_disk_usage}% used"
 }
 
 check_mysql_connection() {
