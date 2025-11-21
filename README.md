@@ -180,11 +180,14 @@ MYSQL_DATA_DIR=                  # MySQL data directory on HOST (required)
 
 #### Backup Storage
 ```bash
-BACKUP_DIR=/var/backups/octeth   # Local backup directory
-TEMP_DIR=/tmp/octeth-backup      # Temporary directory
-MAX_DISK_USAGE=85                # Maximum disk usage % (abort if exceeded)
-MIN_FREE_SPACE_GB=10             # Minimum free space required
+BACKUP_DIR=/var/backups/octeth      # Local backup directory
+TEMP_DIR=/var/backups/octeth/tmp    # Temporary directory (CRITICAL: needs DB size + 20% free space)
+                                     # WARNING: Do NOT use /tmp - often too small!
+MAX_DISK_USAGE=85                   # Maximum disk usage % (abort if exceeded)
+MIN_FREE_SPACE_GB=10                # Minimum free space required
 ```
+
+**IMPORTANT:** `TEMP_DIR` must have enough space for the full uncompressed database backup. The script calculates required space as: Database Size + 20% buffer + 5GB. Using `/tmp` will likely cause "No space left on device" errors for databases larger than a few GB.
 
 #### Compression
 ```bash
@@ -483,18 +486,54 @@ docker exec oempro_mysql mysql -uroot -p'your_password' -e "SHOW DATABASES;"
 DOCKER_CMD="sudo docker"
 ```
 
-### Backup Fails: "Disk space"
+### Backup Fails: "No space left on device"
 
-```bash
-# Check available space
-df -h /var/backups
+This is a critical error that occurs when XtraBackup runs out of disk space during backup. This can also cause MySQL to crash or become unresponsive.
 
-# Clean up old backups manually
-./bin/octeth-cleanup.sh
-
-# Or increase MAX_DISK_USAGE in .env
-MAX_DISK_USAGE=90
+**Symptoms:**
 ```
+xtrabackup: Error writing file ... (OS errno 28 - No space left on device)
+```
+
+**Cause:** The `TEMP_DIR` (default: `/tmp/octeth-backup`) doesn't have enough space for the uncompressed database backup.
+
+**Solution:**
+
+1. **Change TEMP_DIR location** (recommended):
+   ```bash
+   # Edit config/.env
+   TEMP_DIR=/var/backups/octeth/tmp  # Use same disk as backups
+   ```
+
+2. **Check space requirements:**
+   ```bash
+   # Check database size
+   du -sh /opt/oempro/_dockerfiles/mysql/data_v8
+
+   # Check available space in temp directory
+   df -h /var/backups
+
+   # Rule: TEMP_DIR needs DB size + 20% + 5GB free
+   # Example: 10GB database needs ~17GB free in TEMP_DIR
+   ```
+
+3. **Clean up temp directory:**
+   ```bash
+   # Remove any stale temp files
+   rm -rf /var/backups/octeth/tmp/*
+   ```
+
+4. **If MySQL crashed during backup:**
+   ```bash
+   # Restart MySQL container
+   docker restart oempro_mysql
+
+   # Verify MySQL is healthy
+   docker logs oempro_mysql
+   docker exec oempro_mysql mysql -uroot -p'password' -e "SHOW STATUS LIKE 'Uptime';"
+   ```
+
+**Prevention:** Always ensure TEMP_DIR has sufficient space before running backups. The script now checks this automatically and will abort with a clear error if space is insufficient.
 
 ### S3 Upload Fails
 
