@@ -46,7 +46,7 @@ log() {
     shift
     local message="$@"
     local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    echo "[${timestamp}] [${level}] ${message}" | tee -a "${LOG_FILE}"
+    echo "[${timestamp}] [${level}] ${message}" | tee -a "${LOG_FILE}" >&2
 }
 
 log_info() {
@@ -282,7 +282,7 @@ perform_backup() {
         --user=root \
         --password="${MYSQL_ROOT_PASSWORD}" \
         --parallel=${threads} \
-        ${XTRABACKUP_EXTRA_OPTS} 2>&1 | tee -a "${LOG_FILE}" >&2; then
+        ${XTRABACKUP_EXTRA_OPTS} >> "${LOG_FILE}" 2>&1; then
         log_success "XtraBackup completed successfully"
     else
         log_error "XtraBackup failed"
@@ -294,7 +294,7 @@ perform_backup() {
     if [ "${VERIFY_BACKUP}" = "true" ]; then
         log_info "Preparing backup (applying transaction logs)"
 
-        if ${XTRABACKUP_BIN} --prepare --target-dir="${temp_backup_dir}" 2>&1 | tee -a "${LOG_FILE}" >&2; then
+        if ${XTRABACKUP_BIN} --prepare --target-dir="${temp_backup_dir}" >> "${LOG_FILE}" 2>&1; then
             log_success "Backup prepared successfully (ready for restore)"
         else
             log_error "Backup prepare failed"
