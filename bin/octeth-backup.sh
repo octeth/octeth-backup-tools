@@ -312,10 +312,12 @@ compress_backup() {
 
     log_info "Compressing backup with ${COMPRESSION_TOOL}"
 
-    local tar_cmd="tar cf - -C $(dirname ${source_dir}) $(basename ${source_dir})"
-    local compress_cmd="${COMPRESSION_TOOL} -${COMPRESSION_LEVEL}"
+    # Get parent directory and backup directory name
+    local parent_dir=$(dirname "${source_dir}")
+    local backup_dirname=$(basename "${source_dir}")
 
-    if ${tar_cmd} | ${compress_cmd} > "${dest_file}"; then
+    # Compress backup using tar and pigz/gzip
+    if tar -cf - -C "${parent_dir}" "${backup_dirname}" | ${COMPRESSION_TOOL} -${COMPRESSION_LEVEL} > "${dest_file}"; then
         log_success "Backup compressed: ${dest_file}"
 
         # Calculate size
