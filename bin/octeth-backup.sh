@@ -237,11 +237,23 @@ perform_backup() {
         log_info "Connecting to MySQL via exposed port: ${mysql_host}:${mysql_port}"
     fi
 
+    # Verify MySQL data directory exists
+    if [ ! -d "${MYSQL_DATA_DIR}" ]; then
+        log_error "MySQL data directory not found: ${MYSQL_DATA_DIR}"
+        log_error "Please set MYSQL_DATA_DIR in config/.env to the host path of MySQL data"
+        log_error "For Octeth: /opt/oempro/_dockerfiles/mysql/data_v8"
+        EXIT_CODE=1
+        return 1
+    fi
+
+    log_info "MySQL data directory: ${MYSQL_DATA_DIR}"
+
     # Run XtraBackup from HOST (not inside container)
     log_info "Running: xtrabackup --backup"
 
     if ${XTRABACKUP_BIN} --backup \
         --target-dir="${temp_backup_dir}" \
+        --datadir="${MYSQL_DATA_DIR}" \
         --host="${mysql_host}" \
         --port="${mysql_port}" \
         --user=root \
