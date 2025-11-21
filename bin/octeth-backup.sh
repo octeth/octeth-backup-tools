@@ -216,28 +216,44 @@ perform_backup() {
 
     log_info "Using ${threads} parallel threads"
 
-    # Run XtraBackup
+    # Determine MySQL connection method
+    # Try to get MySQL port exposed to host
+    local mysql_port=$(${DOCKER_CMD} port ${MYSQL_HOST} 3306 2>/dev/null | cut -d':' -f2 | head -n1)
+    local mysql_host="127.0.0.1"
+
+    if [ -z "$mysql_port" ]; then
+        # Port not exposed, try to get container IP
+        mysql_host=$(${DOCKER_CMD} inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ${MYSQL_HOST} 2>/dev/null | head -n1)
+        mysql_port="3306"
+
+        if [ -z "$mysql_host" ]; then
+            log_error "Cannot determine MySQL connection method. Ensure MySQL container is running and accessible."
+            EXIT_CODE=1
+            return 1
+        fi
+
+        log_info "Connecting to MySQL via container IP: ${mysql_host}:${mysql_port}"
+    else
+        log_info "Connecting to MySQL via exposed port: ${mysql_host}:${mysql_port}"
+    fi
+
+    # Run XtraBackup from HOST (not inside container)
     log_info "Running: xtrabackup --backup"
 
-    if ${DOCKER_CMD} exec ${MYSQL_HOST} bash -c "${XTRABACKUP_BIN} --backup \
-        --target-dir=/tmp/xtrabackup-${BACKUP_NAME} \
+    if ${XTRABACKUP_BIN} --backup \
+        --target-dir="${temp_backup_dir}" \
+        --host="${mysql_host}" \
+        --port="${mysql_port}" \
         --user=root \
-        --password='${MYSQL_ROOT_PASSWORD}' \
+        --password="${MYSQL_ROOT_PASSWORD}" \
         --parallel=${threads} \
-        ${XTRABACKUP_EXTRA_OPTS}" 2>&1 | tee -a "${LOG_FILE}"; then
+        ${XTRABACKUP_EXTRA_OPTS} 2>&1 | tee -a "${LOG_FILE}"; then
         log_success "XtraBackup completed successfully"
     else
         log_error "XtraBackup failed"
         EXIT_CODE=1
         return 1
     fi
-
-    # Copy backup from container to host
-    log_info "Copying backup from container to host"
-    ${DOCKER_CMD} cp ${MYSQL_HOST}:/tmp/xtrabackup-${BACKUP_NAME} "${temp_backup_dir}"
-
-    # Clean up inside container
-    ${DOCKER_CMD} exec ${MYSQL_HOST} rm -rf /tmp/xtrabackup-${BACKUP_NAME}
 
     # Prepare the backup (make it consistent)
     if [ "${VERIFY_BACKUP}" = "true" ]; then
