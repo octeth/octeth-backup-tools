@@ -282,7 +282,7 @@ perform_backup() {
         --user=root \
         --password="${MYSQL_ROOT_PASSWORD}" \
         --parallel=${threads} \
-        ${XTRABACKUP_EXTRA_OPTS} 2>&1 | tee -a "${LOG_FILE}"; then
+        ${XTRABACKUP_EXTRA_OPTS} 2>&1 | tee -a "${LOG_FILE}" >&2; then
         log_success "XtraBackup completed successfully"
     else
         log_error "XtraBackup failed"
@@ -294,7 +294,7 @@ perform_backup() {
     if [ "${VERIFY_BACKUP}" = "true" ]; then
         log_info "Preparing backup (applying transaction logs)"
 
-        if ${XTRABACKUP_BIN} --prepare --target-dir="${temp_backup_dir}" 2>&1 | tee -a "${LOG_FILE}"; then
+        if ${XTRABACKUP_BIN} --prepare --target-dir="${temp_backup_dir}" 2>&1 | tee -a "${LOG_FILE}" >&2; then
             log_success "Backup prepared successfully (ready for restore)"
         else
             log_error "Backup prepare failed"
