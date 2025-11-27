@@ -35,6 +35,33 @@ FORCE_RESTORE=false
 SKIP_CONFIRMATION=false
 
 # ============================================
+# Helper Functions (macOS/POSIX compatibility)
+# ============================================
+
+# Convert string to uppercase (works on Bash 3.x)
+to_upper() {
+    echo "$1" | tr '[:lower:]' '[:upper:]'
+}
+
+# Capitalize first letter (works on Bash 3.x)
+capitalize() {
+    local str="$1"
+    local first=$(echo "${str:0:1}" | tr '[:lower:]' '[:upper:]')
+    local rest="${str:1}"
+    echo "${first}${rest}"
+}
+
+# Get file modification date (works on macOS and Linux)
+get_file_date() {
+    local file="$1"
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        stat -f "%Sm" -t "%Y-%m-%d %H:%M:%S" "$file"
+    else
+        stat -c %y "$file" | cut -d' ' -f1,2 | cut -d'.' -f1
+    fi
+}
+
+# ============================================
 # Logging Functions
 # ============================================
 
@@ -74,24 +101,28 @@ list_local_backups() {
     local found=0
 
     for backup_type in daily weekly monthly; do
-        local dir_var="${backup_type^^}_DIR"
+        local dir_var="$(to_upper "$backup_type")_DIR"
         local dir="${!dir_var}"
 
         if [ ! -d "$dir" ]; then
             continue
         fi
 
-        local backups=($(find "$dir" -maxdepth 1 -name "*.tar.gz" -type f -printf '%T@ %p\n' | sort -rn | cut -d' ' -f2-))
+        # macOS compatible: use ls -t for sorting by modification time
+        local backups=()
+        while IFS= read -r -d '' file; do
+            backups+=("$file")
+        done < <(find "$dir" -maxdepth 1 -name "*.tar.gz" -type f -print0 2>/dev/null | xargs -0 ls -t 2>/dev/null | tr '\n' '\0')
 
         if [ ${#backups[@]} -gt 0 ]; then
             echo ""
-            echo "${backup_type^} Backups:"
+            echo "$(capitalize "$backup_type") Backups:"
             echo "----------------------------------------"
 
             for backup in "${backups[@]}"; do
                 local filename=$(basename "$backup")
                 local size=$(du -h "$backup" | cut -f1)
-                local date=$(stat -c %y "$backup" | cut -d' ' -f1,2 | cut -d'.' -f1)
+                local date=$(get_file_date "$backup")
                 local checksum_file="${backup}.sha256"
                 local checksum_status="✗"
 
@@ -150,7 +181,7 @@ list_s3_with_aws_cli() {
         local s3_prefix="${S3_PREFIX}/${backup_type}/"
 
         echo ""
-        echo "${backup_type^} Backups (S3):"
+        echo "$(capitalize "$backup_type") Backups (S3):"
         echo "----------------------------------------"
 
         aws s3 ls "s3://${S3_BUCKET}/${s3_prefix}" --region "${S3_REGION}" 2>/dev/null | \
@@ -169,7 +200,7 @@ list_s3_with_rclone() {
         local remote_path="${RCLONE_REMOTE}:${S3_BUCKET}/${S3_PREFIX}/${backup_type}/"
 
         echo ""
-        echo "${backup_type^} Backups (S3):"
+        echo "$(capitalize "$backup_type") Backups (S3):"
         echo "----------------------------------------"
 
         rclone lsl "$remote_path" 2>/dev/null | grep "\.tar\.gz$" | sort -r
@@ -346,25 +377,34 @@ perform_restore() {
     local current_data_backup="${BACKUP_DIR}/pre-restore-backup-$(date +%Y%m%d-%H%M%S)"
     log_info "Creating safety backup of current data..."
 
-    # Find MySQL data directory on host
-    local mysql_data_dir=$(${DOCKER_CMD} inspect ${MYSQL_HOST} 2>/dev/null | \
-        grep -A5 '"Mounts"' | grep -A2 '/var/lib/mysql' | grep '"Source"' | \
-        cut -d'"' -f4 | head -n1)
+    # Use MYSQL_DATA_DIR from config, fallback to auto-detection
+    local mysql_data_dir="${MYSQL_DATA_DIR:-}"
 
-    if [ -n "$mysql_data_dir" ] && [ -d "$mysql_data_dir" ]; then
+    if [ -z "$mysql_data_dir" ] || [ ! -d "$mysql_data_dir" ]; then
+        # Try to auto-detect from Docker container mounts
+        log_info "MYSQL_DATA_DIR not set or invalid, trying to auto-detect..."
+        mysql_data_dir=$(${DOCKER_CMD} inspect ${MYSQL_HOST} 2>/dev/null | \
+            grep -A5 '"Mounts"' | grep -A2 '/var/lib/mysql' | grep '"Source"' | \
+            cut -d'"' -f4 | head -n1)
+    fi
+
+    if [ -z "$mysql_data_dir" ] || [ ! -d "$mysql_data_dir" ]; then
+        log_error "Cannot find MySQL data directory"
+        log_error "Please set MYSQL_DATA_DIR in config/.env"
+        exit 1
+    fi
+
+    log_info "Using MySQL data directory: $mysql_data_dir"
+
+    if [ -d "$mysql_data_dir" ]; then
         cp -a "$mysql_data_dir" "$current_data_backup" || log_warn "Failed to create safety backup"
         log_info "Safety backup created: $current_data_backup"
     fi
 
     # Clear MySQL data directory
     log_info "Clearing MySQL data directory..."
-    if [ -n "$mysql_data_dir" ] && [ -d "$mysql_data_dir" ]; then
-        rm -rf "${mysql_data_dir}"/*
-        log_success "Data directory cleared"
-    else
-        log_error "Cannot find MySQL data directory"
-        exit 1
-    fi
+    rm -rf "${mysql_data_dir}"/*
+    log_success "Data directory cleared"
 
     # Copy restored data
     log_info "Copying restored data to MySQL data directory..."

@@ -33,6 +33,23 @@ DRY_RUN=false
 VERBOSE=false
 
 # ============================================
+# Helper Functions (macOS/POSIX compatibility)
+# ============================================
+
+# Convert string to uppercase (works on Bash 3.x)
+to_upper() {
+    echo "$1" | tr '[:lower:]' '[:upper:]'
+}
+
+# Capitalize first letter (works on Bash 3.x)
+capitalize() {
+    local str="$1"
+    local first=$(echo "${str:0:1}" | tr '[:lower:]' '[:upper:]')
+    local rest="${str:1}"
+    echo "${first}${rest}"
+}
+
+# ============================================
 # Logging Functions
 # ============================================
 
@@ -80,7 +97,11 @@ cleanup_directory() {
     log_info "Retention policy: Keep last ${retention_count} backups"
 
     # Find all backup files, sorted by modification time (newest first)
-    local backup_files=($(find "$dir" -maxdepth 1 -name "*.tar.gz" -type f -printf '%T@ %p\n' | sort -rn | cut -d' ' -f2-))
+    # macOS compatible: use ls -t for sorting by modification time
+    local backup_files=()
+    while IFS= read -r -d '' file; do
+        backup_files+=("$file")
+    done < <(find "$dir" -maxdepth 1 -name "*.tar.gz" -type f -print0 2>/dev/null | xargs -0 ls -t 2>/dev/null | tr '\n' '\0')
     local total_backups=${#backup_files[@]}
 
     log_info "Found ${total_backups} ${backup_type} backup(s)"
@@ -280,13 +301,13 @@ show_statistics() {
 
     # Count backups by type
     for backup_type in daily weekly monthly; do
-        local dir_var="${backup_type^^}_DIR"
+        local dir_var="$(to_upper "$backup_type")_DIR"
         local dir="${!dir_var}"
 
         if [ -d "$dir" ]; then
             local count=$(find "$dir" -maxdepth 1 -name "*.tar.gz" -type f | wc -l)
             local total_size=$(du -sh "$dir" 2>/dev/null | cut -f1 || echo "0")
-            log_info "${backup_type^} backups: ${count} (${total_size})"
+            log_info "$(capitalize "$backup_type") backups: ${count} (${total_size})"
         fi
     done
 

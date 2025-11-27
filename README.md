@@ -658,6 +658,98 @@ tail -50 /var/log/octeth-backup.log
 ./bin/octeth-cleanup.sh --stats
 ```
 
+## Restoring Production Backups to macOS (Local Development)
+
+When restoring XtraBackup backups from a Linux production server to macOS for local development, you'll encounter a `lower_case_table_names` incompatibility:
+
+```
+Different lower_case_table_names settings for server ('2') and data dictionary ('0').
+Data Dictionary initialization failed.
+```
+
+**Why this happens:** Linux uses case-sensitive filesystems (`lower_case_table_names=0`), while macOS uses case-insensitive filesystems (`lower_case_table_names=2`). MySQL stores this setting in the data dictionary and refuses to start if there's a mismatch.
+
+### Solution: Use Docker Named Volumes
+
+Docker named volumes use a Linux filesystem inside Docker Desktop's VM, preserving Linux behavior.
+
+#### Step 1: Create docker-compose.override.yml
+
+Create a file in your Oempro project directory that overrides the MySQL volume:
+
+```yaml
+# docker-compose.override.yml (Mac-only, add to .gitignore)
+services:
+  mysql:
+    volumes:
+      - ./_dockerfiles/mysql/log_v8:/var/log/mysql
+      - ./_dockerfiles/mysql/conf.d:/etc/mysql/conf.d
+      - oempro_mysql_data:/var/lib/mysql  # Named volume instead of bind mount
+
+volumes:
+  oempro_mysql_data:
+```
+
+Add to `.gitignore`:
+```bash
+echo "docker-compose.override.yml" >> .gitignore
+```
+
+#### Step 2: Restore Backup into Docker Volume
+
+```bash
+# Download backup from production server to ~/tmp/
+scp user@production:/var/backups/octeth/daily/octeth-backup-YYYY-MM-DD.tar.gz ~/tmp/
+
+# Extract backup into the Docker volume
+docker compose run --rm \
+  -v ~/tmp:/backup \
+  --entrypoint bash mysql -c \
+  "cd /var/lib/mysql && tar -xzf /backup/octeth-backup-YYYY-MM-DD.tar.gz --strip-components=1"
+```
+
+#### Step 3: Clean Up XtraBackup Artifacts
+
+```bash
+docker compose run --rm --entrypoint bash mysql -c \
+  "rm -f /var/lib/mysql/xtrabackup_* /var/lib/mysql/backup-my.cnf /var/lib/mysql/mysql.sock && \
+   chown -R mysql:mysql /var/lib/mysql"
+```
+
+#### Step 4: Start MySQL
+
+```bash
+docker compose up -d mysql
+
+# Verify it's running
+docker compose ps mysql
+```
+
+#### Important Notes
+
+- **Use production passwords**: The restored database has production MySQL credentials, not your local `.env` passwords
+- **Volume persists**: The named volume persists between container restarts. To reset, run:
+  ```bash
+  docker compose down
+  docker volume rm oempro_oempro_mysql_data
+  ```
+- **First-time setup**: Docker Compose automatically creates the volume on first run
+- **Keep override file local**: Don't commit `docker-compose.override.yml` to git - it's Mac-specific
+
+### Alternative: Use mysqldump for Cross-Platform
+
+If you prefer logical backups that work across platforms:
+
+```bash
+# On production (creates SQL dump)
+docker exec oempro_mysql mysqldump -u root -p'password' --all-databases > dump.sql
+
+# On macOS (restore SQL dump)
+docker exec -i oempro_mysql mysql -u root -p'password' < dump.sql
+```
+
+Note: mysqldump is slower and causes brief locks, but produces platform-independent backups.
+
 ## FAQ
 
 ### Q: Does this cause downtime?

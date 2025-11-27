@@ -1,7 +1,14 @@
 {
   "permissions": {
     "allow": [
-      "Bash(chmod:*)"
+      "Bash(chmod:*)",
+      "Bash(./bin/octeth-restore.sh:*)",
+      "Bash(docker logs:*)",
+      "Bash(cat:*)",
+      "Bash(docker compose run:*)",
+      "Bash(docker volume create:*)",
+      "Bash(docker run:*)",
+      "Bash(docker compose:*)"
     ],
     "deny": [],
     "ask": []
