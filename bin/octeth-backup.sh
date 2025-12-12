@@ -338,15 +338,30 @@ compress_backup() {
 }
 
 # ============================================
+# Cloud Storage Upload Functions
+# ============================================
+
+upload_to_cloud() {
+    local backup_file="$1"
+
+    if [ "${CLOUD_STORAGE_PROVIDER}" = "s3" ]; then
+        upload_to_s3 "$backup_file"
+    elif [ "${CLOUD_STORAGE_PROVIDER}" = "gcs" ]; then
+        upload_to_gcs "$backup_file"
+    elif [ "${CLOUD_STORAGE_PROVIDER}" = "none" ]; then
+        log_info "Cloud storage disabled, skipping upload"
+        return 0
+    else
+        log_error "Unknown cloud storage provider: ${CLOUD_STORAGE_PROVIDER}"
+        return 1
+    fi
+}
+
+# ============================================
 # S3 Upload Functions
 # ============================================
 
 upload_to_s3() {
-    if [ "${S3_UPLOAD_ENABLED}" != "true" ]; then
-        log_info "S3 upload disabled, skipping"
-        return 0
-    fi
-
     local backup_file="$1"
     local checksum_file="${backup_file}.sha256"
     local s3_path="${BACKUP_TYPE}/$(basename ${backup_file})"
@@ -354,9 +369,9 @@ upload_to_s3() {
     log_info "Uploading to S3: s3://${S3_BUCKET}/${S3_PREFIX}/${s3_path}"
 
     if [ "${S3_UPLOAD_TOOL}" = "awscli" ]; then
-        upload_with_aws_cli "$backup_file" "$s3_path"
+        upload_s3_with_aws_cli "$backup_file" "$s3_path"
     elif [ "${S3_UPLOAD_TOOL}" = "rclone" ]; then
-        upload_with_rclone "$backup_file" "$s3_path"
+        upload_s3_with_rclone "$backup_file" "$s3_path"
     else
         log_error "Unknown S3 upload tool: ${S3_UPLOAD_TOOL}"
         return 1
@@ -365,14 +380,14 @@ upload_to_s3() {
     # Upload checksum file
     if [ -f "$checksum_file" ]; then
         if [ "${S3_UPLOAD_TOOL}" = "awscli" ]; then
-            upload_with_aws_cli "$checksum_file" "${s3_path}.sha256"
+            upload_s3_with_aws_cli "$checksum_file" "${s3_path}.sha256"
         else
-            upload_with_rclone "$checksum_file" "${s3_path}.sha256"
+            upload_s3_with_rclone "$checksum_file" "${s3_path}.sha256"
         fi
     fi
 }
 
-upload_with_aws_cli() {
+upload_s3_with_aws_cli() {
     local file="$1"
     local s3_path="$2"
 
@@ -397,7 +412,7 @@ upload_with_aws_cli() {
     fi
 }
 
-upload_with_rclone() {
+upload_s3_with_rclone() {
     local file="$1"
     local s3_path="$2"
 
@@ -410,6 +425,89 @@ upload_with_rclone() {
         log_success "Uploaded with rclone: ${s3_path}"
     else
         log_error "rclone upload failed"
+        return 1
+    fi
+}
+
+# ============================================
+# GCS Upload Functions
+# ============================================
+
+upload_to_gcs() {
+    local backup_file="$1"
+    local checksum_file="${backup_file}.sha256"
+    local gcs_path="${BACKUP_TYPE}/$(basename ${backup_file})"
+
+    log_info "Uploading to GCS: gs://${GCS_BUCKET}/${GCS_PREFIX}/${gcs_path}"
+
+    if [ "${GCS_UPLOAD_TOOL}" = "gsutil" ]; then
+        upload_gcs_with_gsutil "$backup_file" "$gcs_path"
+    elif [ "${GCS_UPLOAD_TOOL}" = "rclone" ]; then
+        upload_gcs_with_rclone "$backup_file" "$gcs_path"
+    else
+        log_error "Unknown GCS upload tool: ${GCS_UPLOAD_TOOL}"
+        return 1
+    fi
+
+    # Upload checksum file
+    if [ -f "$checksum_file" ]; then
+        if [ "${GCS_UPLOAD_TOOL}" = "gsutil" ]; then
+            upload_gcs_with_gsutil "$checksum_file" "${gcs_path}.sha256"
+        else
+            upload_gcs_with_rclone "$checksum_file" "${gcs_path}.sha256"
+        fi
+    fi
+}
+
+upload_gcs_with_gsutil() {
+    local file="$1"
+    local gcs_path="$2"
+
+    if ! command -v gsutil &> /dev/null; then
+        log_error "gsutil not found. Install Google Cloud SDK: https://cloud.google.com/sdk/docs/install"
+        return 1
+    fi
+
+    # Set credentials if provided
+    if [ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]; then
+        export GOOGLE_APPLICATION_CREDENTIALS
+    fi
+
+    # Build gsutil command with optional project ID
+    local gsutil_opts=""
+    if [ -n "${GCS_PROJECT_ID:-}" ]; then
+        gsutil_opts="-u ${GCS_PROJECT_ID}"
+    fi
+
+    if gsutil ${gsutil_opts} -h "Content-Type:application/gzip" \
+        cp -v "$file" "gs://${GCS_BUCKET}/${GCS_PREFIX}/${gcs_path}" 2>&1 | tee -a "${LOG_FILE}"; then
+
+        # Set storage class if specified
+        if [ -n "${GCS_STORAGE_CLASS:-}" ] && [ "${GCS_STORAGE_CLASS}" != "STANDARD" ]; then
+            gsutil ${gsutil_opts} rewrite -s "${GCS_STORAGE_CLASS}" \
+                "gs://${GCS_BUCKET}/${GCS_PREFIX}/${gcs_path}" 2>&1 | tee -a "${LOG_FILE}" || true
+        fi
+
+        log_success "Uploaded to GCS: ${gcs_path}"
+    else
+        log_error "GCS upload failed"
+        return 1
+    fi
+}
+
+upload_gcs_with_rclone() {
+    local file="$1"
+    local gcs_path="$2"
+
+    if ! command -v rclone &> /dev/null; then
+        log_error "rclone not found"
+        return 1
+    fi
+
+    if rclone copy "$file" "${GCS_RCLONE_REMOTE}:${GCS_BUCKET}/${GCS_PREFIX}/${BACKUP_TYPE}/" 2>&1 | tee -a "${LOG_FILE}"; then
+        log_success "Uploaded to GCS with rclone: ${gcs_path}"
+    else
+        log_error "rclone upload to GCS failed"
         return 1
     fi
 }
@@ -446,7 +544,7 @@ Backup Details:
 - Size: ${size}
 - Duration: ${duration}s
 - Location: ${backup_file}
-- S3: ${S3_UPLOAD_ENABLED}
+- Cloud Storage: ${CLOUD_STORAGE_PROVIDER}
 "
 
     if [ "${EMAIL_NOTIFICATIONS}" = "true" ]; then
@@ -545,8 +643,8 @@ main() {
         exit 1
     fi
 
-    # Upload to S3
-    upload_to_s3 "$backup_file" || log_warn "S3 upload failed (continuing anyway)"
+    # Upload to cloud storage
+    upload_to_cloud "$backup_file" || log_warn "Cloud upload failed (continuing anyway)"
 
     # Success
     local duration=$(($(date +%s) - BACKUP_START_TIME))

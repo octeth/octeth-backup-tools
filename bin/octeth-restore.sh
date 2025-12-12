@@ -146,12 +146,21 @@ list_local_backups() {
     echo "=========================================="
 }
 
-list_s3_backups() {
-    if [ "${S3_UPLOAD_ENABLED}" != "true" ]; then
-        log_warn "S3 upload is disabled in configuration"
+list_cloud_backups() {
+    if [ "${CLOUD_STORAGE_PROVIDER}" = "s3" ]; then
+        list_s3_backups
+    elif [ "${CLOUD_STORAGE_PROVIDER}" = "gcs" ]; then
+        list_gcs_backups
+    elif [ "${CLOUD_STORAGE_PROVIDER}" = "none" ]; then
+        log_warn "Cloud storage is disabled in configuration"
+        return 1
+    else
+        log_error "Unknown cloud storage provider: ${CLOUD_STORAGE_PROVIDER}"
         return 1
     fi
+}
 
+list_s3_backups() {
     log_info "=========================================="
     log_info "Available S3 Backups"
     log_info "=========================================="
@@ -201,6 +210,70 @@ list_s3_with_rclone() {
 
         echo ""
         echo "$(capitalize "$backup_type") Backups (S3):"
+        echo "----------------------------------------"
+
+        rclone lsl "$remote_path" 2>/dev/null | grep "\.tar\.gz$" | sort -r
+    done
+}
+
+# ============================================
+# GCS Listing Functions
+# ============================================
+
+list_gcs_backups() {
+    log_info "=========================================="
+    log_info "Available GCS Backups"
+    log_info "=========================================="
+
+    if [ "${GCS_UPLOAD_TOOL}" = "gsutil" ]; then
+        list_gcs_with_gsutil
+    elif [ "${GCS_UPLOAD_TOOL}" = "rclone" ]; then
+        list_gcs_with_rclone
+    fi
+
+    echo "=========================================="
+}
+
+list_gcs_with_gsutil() {
+    if ! command -v gsutil &> /dev/null; then
+        log_error "gsutil not found"
+        return 1
+    fi
+
+    # Set credentials if provided
+    if [ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]; then
+        export GOOGLE_APPLICATION_CREDENTIALS
+    fi
+
+    local gsutil_opts=""
+    if [ -n "${GCS_PROJECT_ID:-}" ]; then
+        gsutil_opts="-u ${GCS_PROJECT_ID}"
+    fi
+
+    for backup_type in daily weekly monthly; do
+        local gcs_prefix="gs://${GCS_BUCKET}/${GCS_PREFIX}/${backup_type}/"
+
+        echo ""
+        echo "$(capitalize "$backup_type") Backups (GCS):"
+        echo "----------------------------------------"
+
+        gsutil ${gsutil_opts} ls -l "$gcs_prefix" 2>/dev/null | \
+            grep "\.tar\.gz$" | sort -r | \
+            awk '{printf "  %-50s  %8s  %s %s\n", $3, $1, $2, ""}'
+    done
+}
+
+list_gcs_with_rclone() {
+    if ! command -v rclone &> /dev/null; then
+        log_error "rclone not found"
+        return 1
+    fi
+
+    for backup_type in daily weekly monthly; do
+        local remote_path="${GCS_RCLONE_REMOTE}:${GCS_BUCKET}/${GCS_PREFIX}/${backup_type}/"
+
+        echo ""
+        echo "$(capitalize "$backup_type") Backups (GCS):"
         echo "----------------------------------------"
 
         rclone lsl "$remote_path" 2>/dev/null | grep "\.tar\.gz$" | sort -r
@@ -274,6 +347,81 @@ download_with_rclone() {
         log_success "Downloaded from S3"
     else
         log_error "Failed to download from S3"
+        exit 1
+    fi
+}
+
+# ============================================
+# GCS Download Functions
+# ============================================
+
+download_from_gcs() {
+    local backup_name="$1"
+    local backup_type="$2"
+    local dest_dir="${TEMP_DIR}/restore"
+
+    mkdir -p "$dest_dir"
+
+    log_info "Downloading from GCS: ${backup_name}"
+
+    if [ "${GCS_UPLOAD_TOOL}" = "gsutil" ]; then
+        download_gcs_with_gsutil "$backup_name" "$backup_type" "$dest_dir"
+    elif [ "${GCS_UPLOAD_TOOL}" = "rclone" ]; then
+        download_gcs_with_rclone "$backup_name" "$backup_type" "$dest_dir"
+    fi
+
+    echo "${dest_dir}/${backup_name}"
+}
+
+download_gcs_with_gsutil() {
+    local backup_name="$1"
+    local backup_type="$2"
+    local dest_dir="$3"
+
+    if ! command -v gsutil &> /dev/null; then
+        log_error "gsutil not found"
+        exit 1
+    fi
+
+    # Set credentials if provided
+    if [ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]; then
+        export GOOGLE_APPLICATION_CREDENTIALS
+    fi
+
+    local gsutil_opts=""
+    if [ -n "${GCS_PROJECT_ID:-}" ]; then
+        gsutil_opts="-u ${GCS_PROJECT_ID}"
+    fi
+
+    local gcs_path="gs://${GCS_BUCKET}/${GCS_PREFIX}/${backup_type}/${backup_name}"
+
+    if gsutil ${gsutil_opts} cp "$gcs_path" "${dest_dir}/${backup_name}"; then
+        log_success "Downloaded from GCS"
+    else
+        log_error "Failed to download from GCS"
+        exit 1
+    fi
+
+    # Download checksum if available
+    gsutil ${gsutil_opts} cp "${gcs_path}.sha256" "${dest_dir}/${backup_name}.sha256" 2>/dev/null || true
+}
+
+download_gcs_with_rclone() {
+    local backup_name="$1"
+    local backup_type="$2"
+    local dest_dir="$3"
+
+    if ! command -v rclone &> /dev/null; then
+        log_error "rclone not found"
+        exit 1
+    fi
+
+    local remote_path="${GCS_RCLONE_REMOTE}:${GCS_BUCKET}/${GCS_PREFIX}/${backup_type}/${backup_name}"
+
+    if rclone copy "$remote_path" "$dest_dir/"; then
+        log_success "Downloaded from GCS"
+    else
+        log_error "Failed to download from GCS"
         exit 1
     fi
 }
@@ -478,9 +626,11 @@ Restores MySQL database from XtraBackup backups
 
 OPTIONS:
     -l, --list              List available local backups
-    -L, --list-s3           List available S3 backups
+    -L, --list-cloud        List available cloud backups (S3/GCS based on config)
     -f, --file FILE         Restore from specific local backup file
-    -s, --s3 NAME TYPE      Restore from S3 backup (NAME and TYPE: daily|weekly|monthly)
+    -c, --cloud NAME TYPE   Restore from cloud backup (NAME and TYPE: daily|weekly|monthly)
+    -s, --s3 NAME TYPE      Restore from S3 backup (deprecated, use --cloud)
+    -g, --gcs NAME TYPE     Restore from GCS backup
     -F, --force             Force restore even if checksum verification fails
     -y, --yes               Skip confirmation prompt
     -h, --help              Display this help message
@@ -489,14 +639,17 @@ EXAMPLES:
     # List available local backups
     $(basename $0) --list
 
-    # List S3 backups
-    $(basename $0) --list-s3
+    # List cloud backups (S3 or GCS based on config)
+    $(basename $0) --list-cloud
 
     # Restore from local backup
     $(basename $0) --file /var/backups/octeth/daily/octeth-backup-2025-01-15_02-00-00.tar.gz
 
-    # Restore from S3 backup
-    $(basename $0) --s3 octeth-backup-2025-01-15_02-00-00.tar.gz daily
+    # Restore from cloud backup (uses CLOUD_STORAGE_PROVIDER from config)
+    $(basename $0) --cloud octeth-backup-2025-01-15_02-00-00.tar.gz daily
+
+    # Restore from GCS backup
+    $(basename $0) --gcs octeth-backup-2025-01-15_02-00-00.tar.gz daily
 
     # Force restore (skip checksum verification)
     $(basename $0) --file backup.tar.gz --force
@@ -514,10 +667,11 @@ EOF
 
 main() {
     local list_local=false
-    local list_s3=false
+    local list_cloud=false
     local backup_file=""
-    local s3_backup_name=""
-    local s3_backup_type=""
+    local cloud_backup_name=""
+    local cloud_backup_type=""
+    local restore_from_cloud=""
 
     # Parse arguments
     while [[ $# -gt 0 ]]; do
@@ -526,18 +680,30 @@ main() {
                 list_local=true
                 shift
                 ;;
-            -L|--list-s3)
-                list_s3=true
+            -L|--list-cloud|--list-s3)
+                list_cloud=true
                 shift
                 ;;
             -f|--file)
                 backup_file="$2"
                 shift 2
                 ;;
+            -c|--cloud)
+                cloud_backup_name="$2"
+                cloud_backup_type="$3"
+                restore_from_cloud="${CLOUD_STORAGE_PROVIDER}"
+                shift 3
+                ;;
             -s|--s3)
-                s3_backup_name="$2"
-                s3_backup_type="$3"
-                RESTORE_FROM_S3=true
+                cloud_backup_name="$2"
+                cloud_backup_type="$3"
+                restore_from_cloud="s3"
+                shift 3
+                ;;
+            -g|--gcs)
+                cloud_backup_name="$2"
+                cloud_backup_type="$3"
+                restore_from_cloud="gcs"
                 shift 3
                 ;;
             -F|--force)
@@ -568,19 +734,26 @@ main() {
         exit 0
     fi
 
-    if [ "$list_s3" = true ]; then
-        list_s3_backups
+    if [ "$list_cloud" = true ]; then
+        list_cloud_backups
         exit 0
     fi
 
     # Restore operations
-    if [ "$RESTORE_FROM_S3" = true ]; then
-        if [ -z "$s3_backup_name" ] || [ -z "$s3_backup_type" ]; then
-            log_error "Both backup name and type are required for S3 restore"
+    if [ -n "$restore_from_cloud" ]; then
+        if [ -z "$cloud_backup_name" ] || [ -z "$cloud_backup_type" ]; then
+            log_error "Both backup name and type are required for cloud restore"
             usage
         fi
 
-        backup_file=$(download_from_s3 "$s3_backup_name" "$s3_backup_type")
+        if [ "$restore_from_cloud" = "s3" ]; then
+            backup_file=$(download_from_s3 "$cloud_backup_name" "$cloud_backup_type")
+        elif [ "$restore_from_cloud" = "gcs" ]; then
+            backup_file=$(download_from_gcs "$cloud_backup_name" "$cloud_backup_type")
+        else
+            log_error "Unknown cloud storage provider: $restore_from_cloud"
+            exit 1
+        fi
     fi
 
     if [ -z "$backup_file" ]; then

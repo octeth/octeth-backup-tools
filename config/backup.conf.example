@@ -19,6 +19,21 @@ else
 fi
 
 # ============================================
+# Backward Compatibility
+# ============================================
+# Handle old S3_UPLOAD_ENABLED variable
+if [ -n "${S3_UPLOAD_ENABLED:-}" ]; then
+    if [ "${S3_UPLOAD_ENABLED}" = "true" ]; then
+        CLOUD_STORAGE_PROVIDER="${CLOUD_STORAGE_PROVIDER:-s3}"
+    else
+        CLOUD_STORAGE_PROVIDER="${CLOUD_STORAGE_PROVIDER:-none}"
+    fi
+fi
+
+# Set default if not specified
+CLOUD_STORAGE_PROVIDER="${CLOUD_STORAGE_PROVIDER:-none}"
+
+# ============================================
 # Backup Naming Convention
 # ============================================
 # Format: octeth-backup-YYYY-MM-DD_HH-MM-SS

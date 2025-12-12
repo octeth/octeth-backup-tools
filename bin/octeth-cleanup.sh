@@ -135,12 +135,21 @@ cleanup_directory() {
     fi
 }
 
-cleanup_s3_backups() {
-    if [ "${S3_UPLOAD_ENABLED}" != "true" ]; then
-        verbose_log "S3 upload disabled, skipping S3 cleanup"
+cleanup_cloud_backups() {
+    if [ "${CLOUD_STORAGE_PROVIDER}" = "s3" ]; then
+        cleanup_s3_backups
+    elif [ "${CLOUD_STORAGE_PROVIDER}" = "gcs" ]; then
+        cleanup_gcs_backups
+    elif [ "${CLOUD_STORAGE_PROVIDER}" = "none" ]; then
+        verbose_log "Cloud storage disabled, skipping cloud cleanup"
         return 0
+    else
+        log_warn "Unknown cloud storage provider: ${CLOUD_STORAGE_PROVIDER}"
+        return 1
     fi
+}
 
+cleanup_s3_backups() {
     log_info "Cleaning up S3 backups"
 
     if [ "${S3_UPLOAD_TOOL}" = "awscli" ]; then
@@ -259,6 +268,139 @@ cleanup_s3_with_rclone() {
                 log_info "[DRY RUN] Would delete from S3: ${backup_file}"
             else
                 log_info "Deleting from S3: ${backup_file}"
+                rclone delete "${remote_path}${backup_file}" 2>&1 || log_warn "Failed to delete: ${backup_file}"
+            fi
+        done
+    done
+}
+
+# ============================================
+# GCS Cleanup Functions
+# ============================================
+
+cleanup_gcs_backups() {
+    log_info "Cleaning up GCS backups"
+
+    if [ "${GCS_UPLOAD_TOOL}" = "gsutil" ]; then
+        cleanup_gcs_with_gsutil
+    elif [ "${GCS_UPLOAD_TOOL}" = "rclone" ]; then
+        cleanup_gcs_with_rclone
+    else
+        log_warn "Unknown GCS upload tool: ${GCS_UPLOAD_TOOL}"
+        return 1
+    fi
+}
+
+cleanup_gcs_with_gsutil() {
+    if ! command -v gsutil &> /dev/null; then
+        log_warn "gsutil not found, skipping GCS cleanup"
+        return 1
+    fi
+
+    # Set credentials if provided
+    if [ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]; then
+        export GOOGLE_APPLICATION_CREDENTIALS
+    fi
+
+    local gsutil_opts=""
+    if [ -n "${GCS_PROJECT_ID:-}" ]; then
+        gsutil_opts="-u ${GCS_PROJECT_ID}"
+    fi
+
+    # Cleanup each backup type in GCS
+    for backup_type in daily weekly monthly; do
+        local gcs_prefix="gs://${GCS_BUCKET}/${GCS_PREFIX}/${backup_type}/"
+
+        # Get retention count for this type
+        local retention_count
+        case "$backup_type" in
+            daily)
+                retention_count=${RETENTION_DAILY}
+                ;;
+            weekly)
+                retention_count=${RETENTION_WEEKLY}
+                ;;
+            monthly)
+                retention_count=${RETENTION_MONTHLY}
+                ;;
+        esac
+
+        log_info "Cleaning up GCS ${backup_type} backups (keep last ${retention_count})"
+
+        # List all backups in GCS for this type
+        local gcs_backups=($(gsutil ${gsutil_opts} ls "$gcs_prefix" 2>/dev/null | \
+            grep "\.tar\.gz$" | sort -r | xargs -n1 basename))
+
+        local total=${#gcs_backups[@]}
+        verbose_log "Found ${total} ${backup_type} backups in GCS"
+
+        if [ "$total" -le "$retention_count" ]; then
+            verbose_log "No GCS cleanup needed for ${backup_type}"
+            continue
+        fi
+
+        # Delete old backups
+        for ((i=retention_count; i<total; i++)); do
+            local backup_file="${gcs_backups[$i]}"
+            local gcs_path="${gcs_prefix}${backup_file}"
+
+            if [ "$DRY_RUN" = true ]; then
+                log_info "[DRY RUN] Would delete from GCS: ${backup_file}"
+            else
+                log_info "Deleting from GCS: ${backup_file}"
+                gsutil ${gsutil_opts} rm "$gcs_path" 2>&1 || log_warn "Failed to delete: ${backup_file}"
+                # Also delete checksum file if exists
+                gsutil ${gsutil_opts} rm "${gcs_path}.sha256" 2>&1 || true
+            fi
+        done
+    done
+}
+
+cleanup_gcs_with_rclone() {
+    if ! command -v rclone &> /dev/null; then
+        log_warn "rclone not found, skipping GCS cleanup"
+        return 1
+    fi
+
+    # Cleanup each backup type in GCS
+    for backup_type in daily weekly monthly; do
+        local remote_path="${GCS_RCLONE_REMOTE}:${GCS_BUCKET}/${GCS_PREFIX}/${backup_type}/"
+
+        # Get retention count for this type
+        local retention_count
+        case "$backup_type" in
+            daily)
+                retention_count=${RETENTION_DAILY}
+                ;;
+            weekly)
+                retention_count=${RETENTION_WEEKLY}
+                ;;
+            monthly)
+                retention_count=${RETENTION_MONTHLY}
+                ;;
+        esac
+
+        log_info "Cleaning up GCS ${backup_type} backups (keep last ${retention_count})"
+
+        # List all backups
+        local gcs_backups=($(rclone lsf "$remote_path" 2>/dev/null | grep "\.tar\.gz$" | sort -r))
+
+        local total=${#gcs_backups[@]}
+        verbose_log "Found ${total} ${backup_type} backups in GCS"
+
+        if [ "$total" -le "$retention_count" ]; then
+            verbose_log "No GCS cleanup needed for ${backup_type}"
+            continue
+        fi
+
+        # Delete old backups
+        for ((i=retention_count; i<total; i++)); do
+            local backup_file="${gcs_backups[$i]}"
+
+            if [ "$DRY_RUN" = true ]; then
+                log_info "[DRY RUN] Would delete from GCS: ${backup_file}"
+            else
+                log_info "Deleting from GCS: ${backup_file}"
                 rclone delete "${remote_path}${backup_file}" 2>&1 || log_warn "Failed to delete: ${backup_file}"
             fi
         done
@@ -404,8 +546,8 @@ main() {
     cleanup_directory "${WEEKLY_DIR}" "${RETENTION_WEEKLY}" "weekly"
     cleanup_directory "${MONTHLY_DIR}" "${RETENTION_MONTHLY}" "monthly"
 
-    # Cleanup S3 backups
-    cleanup_s3_backups
+    # Cleanup cloud backups (S3 or GCS)
+    cleanup_cloud_backups
 
     # Cleanup old logs
     cleanup_old_logs
