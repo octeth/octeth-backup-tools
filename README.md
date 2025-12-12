@@ -1,12 +1,12 @@
 # Octeth MySQL Backup Tool
 
-A professional, production-ready MySQL backup solution for Octeth using Percona XtraBackup. Designed for zero-downtime hot backups of large databases (2GB+) with intelligent retention policies and cloud storage integration (AWS S3 and Google Cloud Storage).
+A professional, production-ready MySQL backup solution for Octeth using Percona XtraBackup. Designed for zero-downtime hot backups of large databases (2GB+) with intelligent retention policies and cloud storage integration (AWS S3, Google Cloud Storage, and Cloudflare R2).
 
 ## Features
 
 - **Zero-Downtime Hot Backups**: Uses Percona XtraBackup for hot backups while MySQL stays online
 - **Smart Retention Policy**: Daily (7 days) + Weekly (4 weeks) + Monthly (6 months)
-- **Cloud Storage**: Local filesystem + AWS S3 or Google Cloud Storage
+- **Cloud Storage**: Local filesystem + AWS S3, Google Cloud Storage, or Cloudflare R2
 - **Production-Ready**: Comprehensive error handling, logging, and notifications
 - **Fast & Efficient**: 70-80% less CPU usage compared to mysqldump
 - **Parallel Compression**: Supports pigz for faster compression
@@ -75,7 +75,7 @@ MYSQL_DATA_DIR=/opt/oempro/_dockerfiles/mysql/data_v8
 # Backup Storage
 BACKUP_DIR=/var/backups/octeth
 
-# Cloud Storage (optional - choose s3, gcs, or none)
+# Cloud Storage (optional - choose s3, gcs, r2, or none)
 CLOUD_STORAGE_PROVIDER=s3
 
 # S3 Settings (if using AWS S3)
@@ -88,6 +88,12 @@ AWS_SECRET_ACCESS_KEY=your_secret
 # GCS_BUCKET=my-octeth-backups
 # GCS_PROJECT_ID=my-project-id
 # GOOGLE_APPLICATION_CREDENTIALS=/path/to/credentials.json
+
+# R2 Settings (if using Cloudflare R2)
+# R2_BUCKET=my-octeth-backups
+# R2_ACCOUNT_ID=your-account-id
+# R2_ACCESS_KEY_ID=your_key
+# R2_SECRET_ACCESS_KEY=your_secret
 ```
 
 ### 3. First Backup
@@ -116,7 +122,7 @@ The backup script automatically:
 2. Determines backup type (daily/weekly/monthly based on date)
 3. Performs hot backup with XtraBackup
 4. Compresses and creates checksum
-5. Uploads to S3 (if enabled)
+5. Uploads to cloud storage (if enabled)
 6. Sends notifications
 7. Logs everything
 
@@ -126,7 +132,7 @@ The backup script automatically:
 # List available local backups
 ./bin/octeth-restore.sh --list
 
-# List cloud backups (S3 or GCS based on config)
+# List cloud backups (S3, GCS, or R2 based on config)
 ./bin/octeth-restore.sh --list-cloud
 
 # Restore from local backup
@@ -211,7 +217,7 @@ PARALLEL_THREADS=auto            # auto or number
 
 #### Cloud Storage
 ```bash
-CLOUD_STORAGE_PROVIDER=none      # s3, gcs, or none
+CLOUD_STORAGE_PROVIDER=none      # s3, gcs, r2, or none
 ```
 
 #### S3 Storage (AWS/DigitalOcean/MinIO)
@@ -235,6 +241,18 @@ GCS_STORAGE_CLASS=NEARLINE       # STANDARD, NEARLINE, COLDLINE, ARCHIVE
 GCS_UPLOAD_TOOL=gsutil           # gsutil or rclone
 GCS_RCLONE_REMOTE=gcs            # rclone remote name (if using rclone)
 GOOGLE_APPLICATION_CREDENTIALS=  # Path to credentials JSON (optional)
+```
+
+#### Cloudflare R2 Storage
+```bash
+R2_BUCKET=my-octeth-backups      # R2 bucket name
+R2_ACCOUNT_ID=                   # R2 account ID (required, from Cloudflare dashboard)
+R2_PREFIX=octeth                 # R2 path prefix
+R2_STORAGE_CLASS=STANDARD        # Not applicable for R2, included for consistency
+R2_ACCESS_KEY_ID=                # R2 API token credentials
+R2_SECRET_ACCESS_KEY=
+R2_UPLOAD_TOOL=awscli            # awscli or rclone
+R2_RCLONE_REMOTE=r2              # rclone remote name (if using rclone)
 ```
 
 #### Retention Policy
@@ -369,7 +387,66 @@ Choose based on your access patterns and cost requirements:
 - **COLDLINE**: Access < 1/quarter, 90-day minimum
 - **ARCHIVE**: Long-term, 365-day minimum, lowest cost
 
-### rclone Setup (Works with Both S3 and GCS)
+### Cloudflare R2 Storage
+
+Cloudflare R2 is an S3-compatible object storage with zero egress fees, making it ideal for backups.
+
+#### AWS CLI Setup (R2 via S3 API)
+
+```bash
+# Install AWS CLI (done by install.sh)
+# R2 uses S3-compatible API with custom endpoint
+
+# Configure in .env
+CLOUD_STORAGE_PROVIDER=r2
+R2_BUCKET=my-octeth-backups
+R2_ACCOUNT_ID=your-account-id  # Found in Cloudflare dashboard
+R2_ACCESS_KEY_ID=your_r2_key
+R2_SECRET_ACCESS_KEY=your_r2_secret
+R2_UPLOAD_TOOL=awscli
+
+# Test R2 access
+aws s3 ls s3://my-octeth-backups/ --endpoint-url https://YOUR_ACCOUNT_ID.r2.cloudflarestorage.com
+```
+
+#### Getting R2 Credentials
+
+1. Log in to Cloudflare Dashboard
+2. Go to R2 > Overview
+3. Create a new R2 bucket (if needed)
+4. Go to "Manage R2 API Tokens"
+5. Create API token with:
+   - **Permissions**: Object Read & Write
+   - **Bucket**: Specify your backup bucket or all buckets
+6. Copy the Access Key ID and Secret Access Key
+7. Note your Account ID from the R2 Overview page
+
+#### R2 Features
+
+- **Zero Egress Fees**: No charges for data retrieval
+- **S3-Compatible**: Works with AWS CLI and tools
+- **Global Performance**: Automatic geographic distribution
+- **Cost-Effective**: ~$0.015/GB/month storage
+
+#### rclone Setup for R2
+
+```bash
+# Configure rclone for R2
+rclone config
+# Choose: Amazon S3 or S3-compatible
+# Provider: Any S3-compatible
+# Endpoint: https://YOUR_ACCOUNT_ID.r2.cloudflarestorage.com
+# Enter Access Key ID and Secret Access Key
+
+# Configure in .env
+R2_UPLOAD_TOOL=rclone
+R2_RCLONE_REMOTE=r2  # Name you gave in rclone config
+
+# Test access
+rclone ls r2:my-octeth-backups/
+```
+
+### rclone Setup (Works with S3, GCS, and R2)
 
 ```bash
 # Install rclone

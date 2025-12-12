@@ -140,6 +140,8 @@ cleanup_cloud_backups() {
         cleanup_s3_backups
     elif [ "${CLOUD_STORAGE_PROVIDER}" = "gcs" ]; then
         cleanup_gcs_backups
+    elif [ "${CLOUD_STORAGE_PROVIDER}" = "r2" ]; then
+        cleanup_r2_backups
     elif [ "${CLOUD_STORAGE_PROVIDER}" = "none" ]; then
         verbose_log "Cloud storage disabled, skipping cloud cleanup"
         return 0
@@ -401,6 +403,138 @@ cleanup_gcs_with_rclone() {
                 log_info "[DRY RUN] Would delete from GCS: ${backup_file}"
             else
                 log_info "Deleting from GCS: ${backup_file}"
+                rclone delete "${remote_path}${backup_file}" 2>&1 || log_warn "Failed to delete: ${backup_file}"
+            fi
+        done
+    done
+}
+
+# ============================================
+# Cloudflare R2 Cleanup Functions
+# ============================================
+
+cleanup_r2_backups() {
+    log_info "Cleaning up R2 backups"
+
+    if [ "${R2_UPLOAD_TOOL}" = "awscli" ]; then
+        cleanup_r2_with_aws_cli
+    elif [ "${R2_UPLOAD_TOOL}" = "rclone" ]; then
+        cleanup_r2_with_rclone
+    else
+        log_warn "Unknown R2 upload tool: ${R2_UPLOAD_TOOL}"
+        return 1
+    fi
+}
+
+cleanup_r2_with_aws_cli() {
+    if ! command -v aws &> /dev/null; then
+        log_warn "AWS CLI not found, skipping R2 cleanup"
+        return 1
+    fi
+
+    # Set R2 credentials
+    if [ -n "${R2_ACCESS_KEY_ID:-}" ]; then
+        export AWS_ACCESS_KEY_ID="${R2_ACCESS_KEY_ID}"
+        export AWS_SECRET_ACCESS_KEY="${R2_SECRET_ACCESS_KEY}"
+    fi
+
+    # R2 endpoint URL
+    local r2_endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+
+    # Cleanup each backup type in R2
+    for backup_type in daily weekly monthly; do
+        local r2_prefix="${R2_PREFIX}/${backup_type}/"
+
+        # Get retention count for this type
+        local retention_count
+        case "$backup_type" in
+            daily)
+                retention_count=${RETENTION_DAILY}
+                ;;
+            weekly)
+                retention_count=${RETENTION_WEEKLY}
+                ;;
+            monthly)
+                retention_count=${RETENTION_MONTHLY}
+                ;;
+        esac
+
+        log_info "Cleaning up R2 ${backup_type} backups (keep last ${retention_count})"
+
+        # List all backups in R2 for this type
+        local r2_backups=($(aws s3 ls "s3://${R2_BUCKET}/${r2_prefix}" --endpoint-url "${r2_endpoint}" 2>/dev/null | \
+            grep "\.tar\.gz$" | sort -r | awk '{print $4}'))
+
+        local total=${#r2_backups[@]}
+        verbose_log "Found ${total} ${backup_type} backups in R2"
+
+        if [ "$total" -le "$retention_count" ]; then
+            verbose_log "No R2 cleanup needed for ${backup_type}"
+            continue
+        fi
+
+        # Delete old backups
+        for ((i=retention_count; i<total; i++)); do
+            local backup_file="${r2_backups[$i]}"
+            local r2_path="s3://${R2_BUCKET}/${r2_prefix}${backup_file}"
+
+            if [ "$DRY_RUN" = true ]; then
+                log_info "[DRY RUN] Would delete from R2: ${backup_file}"
+            else
+                log_info "Deleting from R2: ${backup_file}"
+                aws s3 rm "$r2_path" --endpoint-url "${r2_endpoint}" 2>&1 || log_warn "Failed to delete: ${backup_file}"
+                # Also delete checksum file if exists
+                aws s3 rm "${r2_path}.sha256" --endpoint-url "${r2_endpoint}" 2>&1 || true
+            fi
+        done
+    done
+}
+
+cleanup_r2_with_rclone() {
+    if ! command -v rclone &> /dev/null; then
+        log_warn "rclone not found, skipping R2 cleanup"
+        return 1
+    fi
+
+    # Cleanup each backup type in R2
+    for backup_type in daily weekly monthly; do
+        local remote_path="${R2_RCLONE_REMOTE}:${R2_BUCKET}/${R2_PREFIX}/${backup_type}/"
+
+        # Get retention count for this type
+        local retention_count
+        case "$backup_type" in
+            daily)
+                retention_count=${RETENTION_DAILY}
+                ;;
+            weekly)
+                retention_count=${RETENTION_WEEKLY}
+                ;;
+            monthly)
+                retention_count=${RETENTION_MONTHLY}
+                ;;
+        esac
+
+        log_info "Cleaning up R2 ${backup_type} backups (keep last ${retention_count})"
+
+        # List all backups
+        local r2_backups=($(rclone lsf "$remote_path" 2>/dev/null | grep "\.tar\.gz$" | sort -r))
+
+        local total=${#r2_backups[@]}
+        verbose_log "Found ${total} ${backup_type} backups in R2"
+
+        if [ "$total" -le "$retention_count" ]; then
+            verbose_log "No R2 cleanup needed for ${backup_type}"
+            continue
+        fi
+
+        # Delete old backups
+        for ((i=retention_count; i<total; i++)); do
+            local backup_file="${r2_backups[$i]}"
+
+            if [ "$DRY_RUN" = true ]; then
+                log_info "[DRY RUN] Would delete from R2: ${backup_file}"
+            else
+                log_info "Deleting from R2: ${backup_file}"
                 rclone delete "${remote_path}${backup_file}" 2>&1 || log_warn "Failed to delete: ${backup_file}"
             fi
         done
