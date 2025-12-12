@@ -1,12 +1,12 @@
 # Octeth MySQL Backup Tool
 
-A professional, production-ready MySQL backup solution for Octeth using Percona XtraBackup. Designed for zero-downtime hot backups of large databases (2GB+) with intelligent retention policies and S3 integration.
+A professional, production-ready MySQL backup solution for Octeth using Percona XtraBackup. Designed for zero-downtime hot backups of large databases (2GB+) with intelligent retention policies and cloud storage integration (AWS S3 and Google Cloud Storage).
 
 ## Features
 
 - **Zero-Downtime Hot Backups**: Uses Percona XtraBackup for hot backups while MySQL stays online
 - **Smart Retention Policy**: Daily (7 days) + Weekly (4 weeks) + Monthly (6 months)
-- **Dual Storage**: Local filesystem + S3-compatible cloud storage
+- **Cloud Storage**: Local filesystem + AWS S3 or Google Cloud Storage
 - **Production-Ready**: Comprehensive error handling, logging, and notifications
 - **Fast & Efficient**: 70-80% less CPU usage compared to mysqldump
 - **Parallel Compression**: Supports pigz for faster compression
@@ -75,12 +75,19 @@ MYSQL_DATA_DIR=/opt/oempro/_dockerfiles/mysql/data_v8
 # Backup Storage
 BACKUP_DIR=/var/backups/octeth
 
-# S3 Settings (optional)
-S3_UPLOAD_ENABLED=true
+# Cloud Storage (optional - choose s3, gcs, or none)
+CLOUD_STORAGE_PROVIDER=s3
+
+# S3 Settings (if using AWS S3)
 S3_BUCKET=my-octeth-backups
 S3_REGION=us-east-1
 AWS_ACCESS_KEY_ID=your_key
 AWS_SECRET_ACCESS_KEY=your_secret
+
+# GCS Settings (if using Google Cloud Storage)
+# GCS_BUCKET=my-octeth-backups
+# GCS_PROJECT_ID=my-project-id
+# GOOGLE_APPLICATION_CREDENTIALS=/path/to/credentials.json
 ```
 
 ### 3. First Backup
@@ -119,14 +126,20 @@ The backup script automatically:
 # List available local backups
 ./bin/octeth-restore.sh --list
 
-# List S3 backups
-./bin/octeth-restore.sh --list-s3
+# List cloud backups (S3 or GCS based on config)
+./bin/octeth-restore.sh --list-cloud
 
 # Restore from local backup
 ./bin/octeth-restore.sh --file /var/backups/octeth/daily/octeth-backup-2025-01-15_02-00-00.tar.gz
 
-# Restore from S3
+# Restore from cloud (uses CLOUD_STORAGE_PROVIDER from config)
+./bin/octeth-restore.sh --cloud octeth-backup-2025-01-15_02-00-00.tar.gz daily
+
+# Restore from S3 (specific)
 ./bin/octeth-restore.sh --s3 octeth-backup-2025-01-15_02-00-00.tar.gz daily
+
+# Restore from GCS (specific)
+./bin/octeth-restore.sh --gcs octeth-backup-2025-01-15_02-00-00.tar.gz daily
 
 # Force restore (skip checksum verification)
 ./bin/octeth-restore.sh --file backup.tar.gz --force
@@ -196,16 +209,32 @@ COMPRESSION_LEVEL=6              # 1-9 (6 recommended)
 PARALLEL_THREADS=auto            # auto or number
 ```
 
-#### S3 Storage
+#### Cloud Storage
 ```bash
-S3_UPLOAD_ENABLED=false          # Enable S3 uploads
+CLOUD_STORAGE_PROVIDER=none      # s3, gcs, or none
+```
+
+#### S3 Storage (AWS/DigitalOcean/MinIO)
+```bash
 S3_BUCKET=my-octeth-backups      # S3 bucket name
 S3_REGION=us-east-1              # S3 region
 S3_PREFIX=octeth                 # S3 path prefix
 S3_STORAGE_CLASS=STANDARD_IA     # S3 storage class
-AWS_ACCESS_KEY_ID=               # AWS credentials
+AWS_ACCESS_KEY_ID=               # AWS credentials (leave empty for IAM role)
 AWS_SECRET_ACCESS_KEY=
 S3_UPLOAD_TOOL=awscli            # awscli or rclone
+RCLONE_REMOTE=s3                 # rclone remote name (if using rclone)
+```
+
+#### Google Cloud Storage (GCS)
+```bash
+GCS_BUCKET=my-octeth-backups     # GCS bucket name
+GCS_PROJECT_ID=                  # GCS project ID (optional, auto-detected if not set)
+GCS_PREFIX=octeth                # GCS path prefix
+GCS_STORAGE_CLASS=NEARLINE       # STANDARD, NEARLINE, COLDLINE, ARCHIVE
+GCS_UPLOAD_TOOL=gsutil           # gsutil or rclone
+GCS_RCLONE_REMOTE=gcs            # rclone remote name (if using rclone)
+GOOGLE_APPLICATION_CREDENTIALS=  # Path to credentials JSON (optional)
 ```
 
 #### Retention Policy
@@ -262,33 +291,28 @@ Cleanup runs automatically and removes:
 - Weekly backups older than 4 weeks
 - Monthly backups older than 6 months
 
-## S3 Storage
+## Cloud Storage
 
-### AWS CLI Setup
+### AWS S3 Storage
+
+#### AWS CLI Setup
 
 ```bash
 # Install AWS CLI (done by install.sh)
 # Configure in .env or use IAM instance role
 
+# Configure in .env
+CLOUD_STORAGE_PROVIDER=s3
+S3_BUCKET=my-octeth-backups
+S3_REGION=us-east-1
+AWS_ACCESS_KEY_ID=your_key
+AWS_SECRET_ACCESS_KEY=your_secret
+
 # Test S3 access
 aws s3 ls s3://my-octeth-backups/
 ```
 
-### rclone Setup
-
-```bash
-# Install rclone
-curl https://rclone.org/install.sh | sudo bash
-
-# Configure rclone
-rclone config
-
-# Set in .env
-S3_UPLOAD_TOOL=rclone
-RCLONE_REMOTE=s3
-```
-
-### S3 Storage Classes
+#### S3 Storage Classes
 
 Choose based on your recovery time requirements:
 
@@ -296,6 +320,80 @@ Choose based on your recovery time requirements:
 - **STANDARD_IA** (recommended): Infrequent access, 30-day minimum
 - **GLACIER_IR**: Archive, minutes retrieval, lowest cost
 - **DEEP_ARCHIVE**: Long-term, 12-hour retrieval
+
+### Google Cloud Storage (GCS)
+
+#### gsutil Setup
+
+```bash
+# Install Google Cloud SDK
+# Ubuntu/Debian:
+curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo apt-key add -
+echo "deb https://packages.cloud.google.com/apt cloud-sdk main" | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list
+sudo apt-get update && sudo apt-get install google-cloud-sdk
+
+# Authenticate
+gcloud auth login
+gcloud config set project YOUR_PROJECT_ID
+
+# Configure in .env
+CLOUD_STORAGE_PROVIDER=gcs
+GCS_BUCKET=my-octeth-backups
+GCS_PROJECT_ID=my-project-id
+GCS_UPLOAD_TOOL=gsutil
+
+# Test GCS access
+gsutil ls gs://my-octeth-backups/
+```
+
+#### Service Account Setup (Recommended for Production)
+
+```bash
+# Create service account in GCP Console
+# Download JSON key file
+
+# Configure in .env
+GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account-key.json
+
+# Grant permissions to service account:
+# - Storage Object Admin (for bucket)
+# - Storage Legacy Bucket Reader (for listing)
+```
+
+#### GCS Storage Classes
+
+Choose based on your access patterns and cost requirements:
+
+- **STANDARD**: Frequent access, highest performance
+- **NEARLINE** (recommended): Access < 1/month, 30-day minimum
+- **COLDLINE**: Access < 1/quarter, 90-day minimum
+- **ARCHIVE**: Long-term, 365-day minimum, lowest cost
+
+### rclone Setup (Works with Both S3 and GCS)
+
+```bash
+# Install rclone
+curl https://rclone.org/install.sh | sudo bash
+
+# Configure rclone for S3
+rclone config
+# Choose: Amazon S3 or S3-compatible
+
+# Configure rclone for GCS
+rclone config
+# Choose: Google Cloud Storage
+
+# Set in .env
+# For S3:
+CLOUD_STORAGE_PROVIDER=s3
+S3_UPLOAD_TOOL=rclone
+RCLONE_REMOTE=s3
+
+# For GCS:
+CLOUD_STORAGE_PROVIDER=gcs
+GCS_UPLOAD_TOOL=rclone
+GCS_RCLONE_REMOTE=gcs
+```
 
 ## Monitoring & Notifications
 
