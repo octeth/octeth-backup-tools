@@ -21,7 +21,7 @@ This file provides comprehensive guidance for AI assistants (Claude, GitHub Copi
 - **Database**: MySQL 8.0+ (via Docker containers)
 - **Backup Tool**: Percona XtraBackup 8.0
 - **Compression**: pigz (parallel gzip) or gzip
-- **Cloud Storage**: AWS S3 (via AWS CLI or rclone)
+- **Cloud Storage**: AWS S3, Google Cloud Storage (GCS), and Cloudflare R2 (via AWS CLI or rclone)
 - **Containerization**: Docker for MySQL
 - **Orchestration**: Cron for scheduled backups
 
@@ -79,11 +79,15 @@ octeth-backup-tools/
 **Purpose**: Restores MySQL databases from XtraBackup backups.
 
 **Key Functions**:
-- `list_local_backups()`: Lists available local backups with metadata (lines 96-147)
-- `list_s3_backups()`: Lists S3 backups (lines 149-166)
-- `download_from_s3()`: Downloads backup from S3 (lines 214-230)
-- `verify_checksum()`: Verifies backup integrity (lines 284-306)
-- `perform_restore()`: Executes full restore process (lines 312-466)
+- `list_local_backups()`: Lists available local backups with metadata
+- `list_s3_backups()`: Lists S3 backups
+- `list_gcs_backups()`: Lists GCS backups
+- `list_r2_backups()`: Lists R2 backups
+- `download_from_s3()`: Downloads backup from S3
+- `download_from_gcs()`: Downloads backup from GCS
+- `download_from_r2()`: Downloads backup from R2
+- `verify_checksum()`: Verifies backup integrity
+- `perform_restore()`: Executes full restore process
 
 **Critical Implementation Details**:
 - **macOS/POSIX Compatibility**: Uses helper functions for cross-platform compatibility (lines 39-62)
@@ -101,15 +105,21 @@ octeth-backup-tools/
 
 ### 3. Cleanup Script (`bin/octeth-cleanup.sh`)
 
-**Purpose**: Enforces retention policies for local and S3 backups.
+**Purpose**: Enforces retention policies for local and cloud backups (S3, GCS, and R2).
 
 **Key Functions**:
-- `cleanup_directory()`: Removes old backups based on retention count (lines 86-136)
-- `cleanup_s3_backups()`: Cleans up S3 backups (lines 138-154)
-- `cleanup_s3_with_aws_cli()`: AWS CLI implementation (lines 156-215)
-- `cleanup_s3_with_rclone()`: rclone implementation (lines 217-266)
-- `cleanup_old_logs()`: Removes old log files (lines 268-291)
-- `show_statistics()`: Displays backup statistics (lines 297-321)
+- `cleanup_directory()`: Removes old backups based on retention count
+- `cleanup_s3_backups()`: Cleans up S3 backups
+- `cleanup_s3_with_aws_cli()`: AWS CLI implementation for S3
+- `cleanup_s3_with_rclone()`: rclone implementation for S3
+- `cleanup_gcs_backups()`: Cleans up GCS backups
+- `cleanup_gcs_with_gsutil()`: gsutil implementation for GCS
+- `cleanup_gcs_with_rclone()`: rclone implementation for GCS
+- `cleanup_r2_backups()`: Cleans up R2 backups
+- `cleanup_r2_with_aws_cli()`: AWS CLI implementation for R2
+- `cleanup_r2_with_rclone()`: rclone implementation for R2
+- `cleanup_old_logs()`: Removes old log files
+- `show_statistics()`: Displays backup statistics
 
 **Retention Policy**:
 - Daily backups: Keep last 7 (configurable via RETENTION_DAILY)
@@ -166,13 +176,27 @@ TEMP_DIR=/var/backups/octeth/tmp     # Must have DB size + 20% + 5GB free
 COMPRESSION_TOOL=auto                # auto, pigz, or gzip
 COMPRESSION_LEVEL=6                  # 1-9 balance
 
+# Cloud Storage
+CLOUD_STORAGE_PROVIDER=none          # s3, gcs, r2, or none
+
 # S3 Storage
-S3_UPLOAD_ENABLED=false
 S3_BUCKET=
 S3_REGION=us-east-1
 S3_STORAGE_CLASS=STANDARD_IA
 AWS_ACCESS_KEY_ID=
 AWS_SECRET_ACCESS_KEY=
+
+# GCS Storage
+GCS_BUCKET=
+GCS_PROJECT_ID=
+GCS_STORAGE_CLASS=NEARLINE
+GOOGLE_APPLICATION_CREDENTIALS=
+
+# R2 Storage (Cloudflare)
+R2_BUCKET=
+R2_ACCOUNT_ID=
+R2_ACCESS_KEY_ID=
+R2_SECRET_ACCESS_KEY=
 
 # Retention
 RETENTION_DAILY=7
@@ -548,10 +572,12 @@ sudo ./install.sh --deps-only
    chmod 700 bin/*.sh
    ```
 
-2. **S3 Access**:
-   - Prefer IAM instance roles over hardcoded credentials
-   - Use least-privilege IAM policies
-   - Enable S3 bucket encryption (AES-256 or KMS)
+2. **Cloud Storage Access**:
+   - **S3**: Prefer IAM instance roles over hardcoded credentials
+   - **GCS**: Use service accounts with minimal permissions
+   - **R2**: Use API tokens with bucket-specific permissions
+   - Use least-privilege policies for all cloud providers
+   - Enable bucket encryption where available
 
 3. **Backup Encryption** (future enhancement):
    - Add GPG encryption option
@@ -582,7 +608,7 @@ Potential improvements (not yet implemented):
 7. **Disaster Recovery**: Automated failover procedures
 8. **Backup Catalog**: Database of all backups with metadata
 9. **Compression Options**: zstd support for better compression
-10. **Cloud Providers**: Azure Blob, Google Cloud Storage support
+10. **Cloud Providers**: Azure Blob Storage support
 
 ## Contributing
 

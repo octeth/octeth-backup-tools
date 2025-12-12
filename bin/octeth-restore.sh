@@ -151,6 +151,8 @@ list_cloud_backups() {
         list_s3_backups
     elif [ "${CLOUD_STORAGE_PROVIDER}" = "gcs" ]; then
         list_gcs_backups
+    elif [ "${CLOUD_STORAGE_PROVIDER}" = "r2" ]; then
+        list_r2_backups
     elif [ "${CLOUD_STORAGE_PROVIDER}" = "none" ]; then
         log_warn "Cloud storage is disabled in configuration"
         return 1
@@ -274,6 +276,69 @@ list_gcs_with_rclone() {
 
         echo ""
         echo "$(capitalize "$backup_type") Backups (GCS):"
+        echo "----------------------------------------"
+
+        rclone lsl "$remote_path" 2>/dev/null | grep "\.tar\.gz$" | sort -r
+    done
+}
+
+# ============================================
+# Cloudflare R2 Listing Functions
+# ============================================
+
+list_r2_backups() {
+    log_info "=========================================="
+    log_info "Available R2 Backups"
+    log_info "=========================================="
+
+    if [ "${R2_UPLOAD_TOOL}" = "awscli" ]; then
+        list_r2_with_aws_cli
+    elif [ "${R2_UPLOAD_TOOL}" = "rclone" ]; then
+        list_r2_with_rclone
+    fi
+
+    echo "=========================================="
+}
+
+list_r2_with_aws_cli() {
+    if ! command -v aws &> /dev/null; then
+        log_error "AWS CLI not found"
+        return 1
+    fi
+
+    # Set R2 credentials
+    if [ -n "${R2_ACCESS_KEY_ID:-}" ]; then
+        export AWS_ACCESS_KEY_ID="${R2_ACCESS_KEY_ID}"
+        export AWS_SECRET_ACCESS_KEY="${R2_SECRET_ACCESS_KEY}"
+    fi
+
+    # R2 endpoint URL
+    local r2_endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+
+    for backup_type in daily weekly monthly; do
+        local r2_prefix="${R2_PREFIX}/${backup_type}/"
+
+        echo ""
+        echo "$(capitalize "$backup_type") Backups (R2):"
+        echo "----------------------------------------"
+
+        aws s3 ls "s3://${R2_BUCKET}/${r2_prefix}" --endpoint-url "${r2_endpoint}" 2>/dev/null | \
+            grep "\.tar\.gz$" | sort -r | \
+            awk '{printf "  %-50s  %8s %s  %s %s\n", $4, $3, $2, $1, $2}'
+    done
+}
+
+list_r2_with_rclone() {
+    if ! command -v rclone &> /dev/null; then
+        log_error "rclone not found"
+        return 1
+    fi
+
+    for backup_type in daily weekly monthly; do
+        local remote_path="${R2_RCLONE_REMOTE}:${R2_BUCKET}/${R2_PREFIX}/${backup_type}/"
+
+        echo ""
+        echo "$(capitalize "$backup_type") Backups (R2):"
         echo "----------------------------------------"
 
         rclone lsl "$remote_path" 2>/dev/null | grep "\.tar\.gz$" | sort -r
@@ -422,6 +487,79 @@ download_gcs_with_rclone() {
         log_success "Downloaded from GCS"
     else
         log_error "Failed to download from GCS"
+        exit 1
+    fi
+}
+
+# ============================================
+# Cloudflare R2 Download Functions
+# ============================================
+
+download_from_r2() {
+    local backup_name="$1"
+    local backup_type="$2"
+    local dest_dir="${TEMP_DIR}/restore"
+
+    mkdir -p "$dest_dir"
+
+    log_info "Downloading from R2: ${backup_name}"
+
+    if [ "${R2_UPLOAD_TOOL}" = "awscli" ]; then
+        download_r2_with_aws_cli "$backup_name" "$backup_type" "$dest_dir"
+    elif [ "${R2_UPLOAD_TOOL}" = "rclone" ]; then
+        download_r2_with_rclone "$backup_name" "$backup_type" "$dest_dir"
+    fi
+
+    echo "${dest_dir}/${backup_name}"
+}
+
+download_r2_with_aws_cli() {
+    local backup_name="$1"
+    local backup_type="$2"
+    local dest_dir="$3"
+
+    if ! command -v aws &> /dev/null; then
+        log_error "AWS CLI not found"
+        exit 1
+    fi
+
+    # Set R2 credentials
+    if [ -n "${R2_ACCESS_KEY_ID:-}" ]; then
+        export AWS_ACCESS_KEY_ID="${R2_ACCESS_KEY_ID}"
+        export AWS_SECRET_ACCESS_KEY="${R2_SECRET_ACCESS_KEY}"
+    fi
+
+    # R2 endpoint URL
+    local r2_endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+    local r2_path="s3://${R2_BUCKET}/${R2_PREFIX}/${backup_type}/${backup_name}"
+
+    if aws s3 cp "$r2_path" "${dest_dir}/${backup_name}" --endpoint-url "${r2_endpoint}"; then
+        log_success "Downloaded from R2"
+    else
+        log_error "Failed to download from R2"
+        exit 1
+    fi
+
+    # Download checksum if available
+    aws s3 cp "${r2_path}.sha256" "${dest_dir}/${backup_name}.sha256" --endpoint-url "${r2_endpoint}" 2>/dev/null || true
+}
+
+download_r2_with_rclone() {
+    local backup_name="$1"
+    local backup_type="$2"
+    local dest_dir="$3"
+
+    if ! command -v rclone &> /dev/null; then
+        log_error "rclone not found"
+        exit 1
+    fi
+
+    local remote_path="${R2_RCLONE_REMOTE}:${R2_BUCKET}/${R2_PREFIX}/${backup_type}/${backup_name}"
+
+    if rclone copy "$remote_path" "$dest_dir/"; then
+        log_success "Downloaded from R2"
+    else
+        log_error "Failed to download from R2"
         exit 1
     fi
 }
@@ -626,11 +764,12 @@ Restores MySQL database from XtraBackup backups
 
 OPTIONS:
     -l, --list              List available local backups
-    -L, --list-cloud        List available cloud backups (S3/GCS based on config)
+    -L, --list-cloud        List available cloud backups (S3/GCS/R2 based on config)
     -f, --file FILE         Restore from specific local backup file
     -c, --cloud NAME TYPE   Restore from cloud backup (NAME and TYPE: daily|weekly|monthly)
     -s, --s3 NAME TYPE      Restore from S3 backup (deprecated, use --cloud)
     -g, --gcs NAME TYPE     Restore from GCS backup
+    -r, --r2 NAME TYPE      Restore from R2 backup
     -F, --force             Force restore even if checksum verification fails
     -y, --yes               Skip confirmation prompt
     -h, --help              Display this help message
@@ -639,7 +778,7 @@ EXAMPLES:
     # List available local backups
     $(basename $0) --list
 
-    # List cloud backups (S3 or GCS based on config)
+    # List cloud backups (S3, GCS, or R2 based on config)
     $(basename $0) --list-cloud
 
     # Restore from local backup
@@ -650,6 +789,9 @@ EXAMPLES:
 
     # Restore from GCS backup
     $(basename $0) --gcs octeth-backup-2025-01-15_02-00-00.tar.gz daily
+
+    # Restore from R2 backup
+    $(basename $0) --r2 octeth-backup-2025-01-15_02-00-00.tar.gz daily
 
     # Force restore (skip checksum verification)
     $(basename $0) --file backup.tar.gz --force
@@ -706,6 +848,12 @@ main() {
                 restore_from_cloud="gcs"
                 shift 3
                 ;;
+            -r|--r2)
+                cloud_backup_name="$2"
+                cloud_backup_type="$3"
+                restore_from_cloud="r2"
+                shift 3
+                ;;
             -F|--force)
                 FORCE_RESTORE=true
                 shift
@@ -750,6 +898,8 @@ main() {
             backup_file=$(download_from_s3 "$cloud_backup_name" "$cloud_backup_type")
         elif [ "$restore_from_cloud" = "gcs" ]; then
             backup_file=$(download_from_gcs "$cloud_backup_name" "$cloud_backup_type")
+        elif [ "$restore_from_cloud" = "r2" ]; then
+            backup_file=$(download_from_r2 "$cloud_backup_name" "$cloud_backup_type")
         else
             log_error "Unknown cloud storage provider: $restore_from_cloud"
             exit 1

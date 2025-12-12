@@ -348,6 +348,8 @@ upload_to_cloud() {
         upload_to_s3 "$backup_file"
     elif [ "${CLOUD_STORAGE_PROVIDER}" = "gcs" ]; then
         upload_to_gcs "$backup_file"
+    elif [ "${CLOUD_STORAGE_PROVIDER}" = "r2" ]; then
+        upload_to_r2 "$backup_file"
     elif [ "${CLOUD_STORAGE_PROVIDER}" = "none" ]; then
         log_info "Cloud storage disabled, skipping upload"
         return 0
@@ -508,6 +510,80 @@ upload_gcs_with_rclone() {
         log_success "Uploaded to GCS with rclone: ${gcs_path}"
     else
         log_error "rclone upload to GCS failed"
+        return 1
+    fi
+}
+
+# ============================================
+# Cloudflare R2 Upload Functions
+# ============================================
+
+upload_to_r2() {
+    local backup_file="$1"
+    local checksum_file="${backup_file}.sha256"
+    local r2_path="${BACKUP_TYPE}/$(basename ${backup_file})"
+
+    log_info "Uploading to R2: https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com/${R2_BUCKET}/${R2_PREFIX}/${r2_path}"
+
+    if [ "${R2_UPLOAD_TOOL}" = "awscli" ]; then
+        upload_r2_with_aws_cli "$backup_file" "$r2_path"
+    elif [ "${R2_UPLOAD_TOOL}" = "rclone" ]; then
+        upload_r2_with_rclone "$backup_file" "$r2_path"
+    else
+        log_error "Unknown R2 upload tool: ${R2_UPLOAD_TOOL}"
+        return 1
+    fi
+
+    # Upload checksum file
+    if [ -f "$checksum_file" ]; then
+        if [ "${R2_UPLOAD_TOOL}" = "awscli" ]; then
+            upload_r2_with_aws_cli "$checksum_file" "${r2_path}.sha256"
+        else
+            upload_r2_with_rclone "$checksum_file" "${r2_path}.sha256"
+        fi
+    fi
+}
+
+upload_r2_with_aws_cli() {
+    local file="$1"
+    local r2_path="$2"
+
+    if ! command -v aws &> /dev/null; then
+        log_error "AWS CLI not found"
+        return 1
+    fi
+
+    # Set R2 credentials
+    if [ -n "${R2_ACCESS_KEY_ID:-}" ]; then
+        export AWS_ACCESS_KEY_ID="${R2_ACCESS_KEY_ID}"
+        export AWS_SECRET_ACCESS_KEY="${R2_SECRET_ACCESS_KEY}"
+    fi
+
+    # R2 endpoint URL
+    local r2_endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+
+    if aws s3 cp "$file" "s3://${R2_BUCKET}/${R2_PREFIX}/${r2_path}" \
+        --endpoint-url "${r2_endpoint}" 2>&1 | tee -a "${LOG_FILE}"; then
+        log_success "Uploaded to R2: ${r2_path}"
+    else
+        log_error "R2 upload failed"
+        return 1
+    fi
+}
+
+upload_r2_with_rclone() {
+    local file="$1"
+    local r2_path="$2"
+
+    if ! command -v rclone &> /dev/null; then
+        log_error "rclone not found"
+        return 1
+    fi
+
+    if rclone copy "$file" "${R2_RCLONE_REMOTE}:${R2_BUCKET}/${R2_PREFIX}/${BACKUP_TYPE}/" 2>&1 | tee -a "${LOG_FILE}"; then
+        log_success "Uploaded to R2 with rclone: ${r2_path}"
+    else
+        log_error "rclone upload to R2 failed"
         return 1
     fi
 }
