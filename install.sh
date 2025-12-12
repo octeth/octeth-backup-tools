@@ -307,9 +307,21 @@ setup_cron() {
     log_info "Setting up cron job..."
 
     # Check if cron job already exists
-    if crontab -l 2>/dev/null | grep -q "octeth-backup.sh"; then
-        log_info "Cron job already exists"
-        return 0
+    local existing_cron=""
+    if crontab -l >/dev/null 2>&1; then
+        existing_cron=$(crontab -l 2>/dev/null | grep "octeth-backup.sh" || true)
+    fi
+
+    if [ -n "$existing_cron" ]; then
+        log_info "Found existing cron job:"
+        echo "  $existing_cron"
+        read -p "Do you want to replace it? (y/n): " replace_cron
+        if [ "$replace_cron" != "y" ] && [ "$replace_cron" != "Y" ]; then
+            log_info "Keeping existing cron job"
+            return 0
+        fi
+        # Remove existing octeth-backup.sh entries
+        crontab -l 2>/dev/null | grep -v "octeth-backup.sh" | crontab - || true
     fi
 
     # Default: Run daily at 2 AM
@@ -331,17 +343,36 @@ setup_cron() {
     fi
 
     # Add cron job
-    (crontab -l 2>/dev/null; echo "$cron_schedule $script_path >> /var/log/octeth-backup.log 2>&1") | crontab -
+    (crontab -l 2>/dev/null || true; echo "$cron_schedule $script_path >> /var/log/octeth-backup.log 2>&1") | crontab -
 
-    log_success "Cron job added: $cron_schedule"
+    # Verify the cron job was added
+    if crontab -l 2>/dev/null | grep -q "octeth-backup.sh"; then
+        log_success "Cron job added: $cron_schedule"
+    else
+        log_error "Failed to add cron job"
+        return 1
+    fi
 
     # Also add cleanup job (run after backup)
     local cleanup_schedule="30 2 * * *"  # 30 minutes after backup
     local cleanup_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/bin/octeth-cleanup.sh"
 
-    if ! crontab -l 2>/dev/null | grep -q "octeth-cleanup.sh"; then
-        (crontab -l 2>/dev/null; echo "$cleanup_schedule $cleanup_path >> /var/log/octeth-backup.log 2>&1") | crontab -
-        log_success "Cleanup cron job added: $cleanup_schedule"
+    local existing_cleanup=""
+    if crontab -l >/dev/null 2>&1; then
+        existing_cleanup=$(crontab -l 2>/dev/null | grep "octeth-cleanup.sh" || true)
+    fi
+
+    if [ -z "$existing_cleanup" ]; then
+        (crontab -l 2>/dev/null || true; echo "$cleanup_schedule $cleanup_path >> /var/log/octeth-backup.log 2>&1") | crontab -
+
+        # Verify cleanup job was added
+        if crontab -l 2>/dev/null | grep -q "octeth-cleanup.sh"; then
+            log_success "Cleanup cron job added: $cleanup_schedule"
+        else
+            log_warn "Failed to add cleanup cron job"
+        fi
+    else
+        log_info "Cleanup cron job already exists"
     fi
 }
 
