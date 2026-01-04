@@ -32,7 +32,8 @@ octeth-backup-tools/
 ├── bin/                          # Executable scripts
 │   ├── octeth-backup.sh         # Main backup script (565 lines)
 │   ├── octeth-restore.sh        # Restore script (596 lines)
-│   └── octeth-cleanup.sh        # Retention policy cleanup (421 lines)
+│   ├── octeth-cleanup.sh        # Retention policy cleanup (421 lines)
+│   └── octeth-test-storage.sh   # Cloud storage connectivity test (651 lines)
 ├── config/                       # Configuration templates
 │   ├── .env.example             # Environment variables template
 │   └── backup.conf.example      # Main configuration template
@@ -151,6 +152,79 @@ octeth-backup-tools/
 - Ubuntu/Debian (apt)
 - CentOS/RHEL/Rocky/AlmaLinux (yum)
 - Fedora (dnf)
+
+### 5. Test Storage Script (`bin/octeth-test-storage.sh`)
+
+**Purpose**: Tests connectivity to configured cloud storage providers (S3, GCS, R2).
+
+**Key Functions**:
+- `create_test_file()`: Creates temporary test file with timestamp
+- `cleanup_test_file()`: Removes local test file after tests
+- `check_tool_installed()`: Verifies upload tool installation (aws/gsutil/rclone)
+- `test_s3_with_aws_cli()`: Tests S3 connectivity using AWS CLI
+- `test_s3_with_rclone()`: Tests S3 connectivity using rclone
+- `test_s3_connectivity()`: Main S3 test orchestrator
+- `test_gcs_with_gsutil()`: Tests GCS connectivity using gsutil
+- `test_gcs_with_rclone()`: Tests GCS connectivity using rclone
+- `test_gcs_connectivity()`: Main GCS test orchestrator
+- `test_r2_with_aws_cli()`: Tests R2 connectivity using AWS CLI (S3-compatible)
+- `test_r2_with_rclone()`: Tests R2 connectivity using rclone
+- `test_r2_connectivity()`: Main R2 test orchestrator
+
+**Test Pattern** (consistent across all providers):
+1. Check if provider is configured (bucket name, credentials)
+2. Verify required tool is installed (aws/gsutil/rclone)
+3. Test authentication and credentials
+4. Verify bucket exists and is accessible (ListBucket permission)
+5. Test write permissions (upload small test file ~245 bytes)
+6. Test read permissions (download test file)
+7. Test delete permissions (remove test file)
+8. Verify storage class validity (S3/GCS only)
+
+**Command-Line Options**:
+- `-v, --verbose`: Detailed output with DEBUG logs
+- `-q, --quiet`: Minimal output (PASS/FAIL only)
+- `-h, --help`: Usage information
+
+**Exit Codes**:
+- `0`: All tests passed
+- `1`: One or more tests failed
+- `2`: Configuration error (missing .env or invalid provider)
+- `3`: Tool not installed (aws/gsutil/rclone)
+
+**Test File Details**:
+- Name: `.octeth-storage-test-{timestamp}.txt`
+- Content: "Octeth Backup Storage Test - {timestamp}"
+- Size: ~245 bytes (minimal cost/bandwidth)
+- Location: `/tmp/` (local), `{PREFIX}/test/` (cloud)
+- Auto-cleanup: Removed after tests complete
+
+**Usage Examples**:
+```bash
+# Test configured storage
+./bin/octeth-test-storage.sh
+
+# Verbose output
+./bin/octeth-test-storage.sh -v
+
+# Quiet mode (for scripts/monitoring)
+./bin/octeth-test-storage.sh -q && echo "Ready for backups"
+
+# Automated monitoring (cron)
+0 */6 * * * /path/to/bin/octeth-test-storage.sh -q || mail -s "Storage test failed" admin@example.com
+```
+
+**Error Handling**:
+- Comprehensive error messages with actionable solutions
+- Tool-specific troubleshooting (links to installation docs)
+- Permission-specific errors (IAM/bucket policies)
+- Graceful handling when cloud storage is disabled (provider=none)
+
+**Integration Points**:
+- Can be run after `install.sh` to verify cloud setup
+- Useful before first backup to catch configuration issues
+- Integrates with monitoring systems via exit codes
+- Minimal cost (tiny test file, auto-cleanup)
 
 ## Configuration System
 

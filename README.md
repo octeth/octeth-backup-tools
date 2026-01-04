@@ -28,7 +28,8 @@ octeth-backup-tools/
 ├── bin/
 │   ├── octeth-backup.sh          # Main backup script
 │   ├── octeth-restore.sh         # Restore script
-│   └── octeth-cleanup.sh         # Retention policy cleanup
+│   ├── octeth-cleanup.sh         # Retention policy cleanup
+│   └── octeth-test-storage.sh    # Cloud storage connectivity test
 ├── config/
 │   ├── .env.example              # Environment configuration template
 │   └── backup.conf.example       # Backup configuration template
@@ -832,6 +833,62 @@ tail -50 /var/log/octeth-backup.log
 # View statistics
 ./bin/octeth-cleanup.sh --stats
 ```
+
+### Test Cloud Storage Connectivity
+
+The `octeth-test-storage.sh` tool tests connectivity to your configured cloud storage provider (AWS S3, Google Cloud Storage, or Cloudflare R2). It verifies credentials, bucket access, and read/write/delete permissions.
+
+```bash
+# Test configured cloud storage
+./bin/octeth-test-storage.sh
+
+# Verbose output (detailed logging)
+./bin/octeth-test-storage.sh -v
+
+# Quiet mode (for scripting)
+./bin/octeth-test-storage.sh -q && echo "Storage ready"
+```
+
+**What it tests:**
+- ✓ Upload tool installation (AWS CLI, gsutil, or rclone)
+- ✓ Authentication and credentials
+- ✓ Bucket exists and is accessible
+- ✓ Write permissions (uploads test file)
+- ✓ Read permissions (downloads test file)
+- ✓ Delete permissions (removes test file)
+- ✓ Storage class validity
+
+**Example output:**
+```
+========================================
+Octeth Storage Connectivity Test
+========================================
+Testing cloud storage provider: s3
+
+[✓] AWS CLI found: aws-cli/2.15.30
+[✓] AWS credentials configured
+[✓] Bucket accessible: s3://my-octeth-backups/octeth/
+[✓] Write test passed (uploaded 245 bytes)
+[✓] Read test passed (downloaded 245 bytes)
+[✓] Delete test passed
+[✓] Storage class valid: STANDARD_IA
+
+========================================
+All tests passed! ✓
+========================================
+```
+
+**Exit codes:**
+- `0`: All tests passed
+- `1`: One or more tests failed
+- `2`: Configuration error (missing .env or invalid provider)
+- `3`: Tool not installed (aws/gsutil/rclone)
+
+**Use cases:**
+- After initial setup to verify cloud configuration
+- Before running first backup to catch credential issues
+- In automated monitoring (cron job every 6 hours)
+- During troubleshooting of backup failures
 
 ## Restoring Production Backups to macOS (Local Development)
 
