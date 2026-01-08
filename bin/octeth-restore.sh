@@ -247,9 +247,9 @@ list_gcs_with_gsutil() {
         export GOOGLE_APPLICATION_CREDENTIALS
     fi
 
-    local gsutil_opts=""
+    # Set project ID via environment variable if provided
     if [ -n "${GCS_PROJECT_ID:-}" ]; then
-        gsutil_opts="-u ${GCS_PROJECT_ID}"
+        export CLOUDSDK_CORE_PROJECT="${GCS_PROJECT_ID}"
     fi
 
     for backup_type in daily weekly monthly; do
@@ -259,7 +259,7 @@ list_gcs_with_gsutil() {
         echo "$(capitalize "$backup_type") Backups (GCS):"
         echo "----------------------------------------"
 
-        gsutil ${gsutil_opts} ls -l "$gcs_prefix" 2>/dev/null | \
+        gsutil ls -l "$gcs_prefix" 2>/dev/null | \
             grep "\.tar\.gz$" | sort -r | \
             awk '{printf "  %-50s  %8s  %s %s\n", $3, $1, $2, ""}'
     done
@@ -453,14 +453,14 @@ download_gcs_with_gsutil() {
         export GOOGLE_APPLICATION_CREDENTIALS
     fi
 
-    local gsutil_opts=""
+    # Set project ID via environment variable if provided
     if [ -n "${GCS_PROJECT_ID:-}" ]; then
-        gsutil_opts="-u ${GCS_PROJECT_ID}"
+        export CLOUDSDK_CORE_PROJECT="${GCS_PROJECT_ID}"
     fi
 
     local gcs_path="gs://${GCS_BUCKET}/${GCS_PREFIX}/${backup_type}/${backup_name}"
 
-    if gsutil ${gsutil_opts} cp "$gcs_path" "${dest_dir}/${backup_name}"; then
+    if gsutil cp "$gcs_path" "${dest_dir}/${backup_name}"; then
         log_success "Downloaded from GCS"
     else
         log_error "Failed to download from GCS"
@@ -468,7 +468,7 @@ download_gcs_with_gsutil() {
     fi
 
     # Download checksum if available
-    gsutil ${gsutil_opts} cp "${gcs_path}.sha256" "${dest_dir}/${backup_name}.sha256" 2>/dev/null || true
+    gsutil cp "${gcs_path}.sha256" "${dest_dir}/${backup_name}.sha256" 2>/dev/null || true
 }
 
 download_gcs_with_rclone() {
