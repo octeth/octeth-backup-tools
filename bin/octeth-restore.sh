@@ -245,6 +245,11 @@ list_gcs_with_gsutil() {
     # Set credentials if provided
     if [ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]; then
         export GOOGLE_APPLICATION_CREDENTIALS="${GOOGLE_APPLICATION_CREDENTIALS}"
+
+        # Activate service account with gcloud (gsutil often ignores GOOGLE_APPLICATION_CREDENTIALS)
+        if [ -f "${GOOGLE_APPLICATION_CREDENTIALS}" ] && command -v gcloud &> /dev/null; then
+            gcloud auth activate-service-account --key-file="${GOOGLE_APPLICATION_CREDENTIALS}" &>/dev/null || true
+        fi
     fi
 
     # Set project ID via environment variable if provided
@@ -451,6 +456,11 @@ download_gcs_with_gsutil() {
     # Set credentials if provided
     if [ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]; then
         export GOOGLE_APPLICATION_CREDENTIALS="${GOOGLE_APPLICATION_CREDENTIALS}"
+
+        # Activate service account with gcloud (gsutil often ignores GOOGLE_APPLICATION_CREDENTIALS)
+        if [ -f "${GOOGLE_APPLICATION_CREDENTIALS}" ] && command -v gcloud &> /dev/null; then
+            gcloud auth activate-service-account --key-file="${GOOGLE_APPLICATION_CREDENTIALS}" &>/dev/null || true
+        fi
     fi
 
     # Set project ID via environment variable if provided

@@ -311,18 +311,68 @@ test_gcs_with_gsutil() {
     if [ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]; then
         export GOOGLE_APPLICATION_CREDENTIALS="${GOOGLE_APPLICATION_CREDENTIALS}"
         log_debug "Using credentials from: ${GOOGLE_APPLICATION_CREDENTIALS}"
+
+        # Verify credentials file exists
+        if [ ! -f "${GOOGLE_APPLICATION_CREDENTIALS}" ]; then
+            log_error "Credentials file not found: ${GOOGLE_APPLICATION_CREDENTIALS}"
+            echo "    → Verify GOOGLE_APPLICATION_CREDENTIALS path in config/.env"
+            return 1
+        fi
+        log_success "Credentials file found: ${GOOGLE_APPLICATION_CREDENTIALS}"
+
+        # Activate service account with gcloud (gsutil often ignores GOOGLE_APPLICATION_CREDENTIALS)
+        if command -v gcloud &> /dev/null; then
+            log_debug "Activating service account with gcloud..."
+            if gcloud auth activate-service-account --key-file="${GOOGLE_APPLICATION_CREDENTIALS}" &>/dev/null; then
+                log_success "Service account activated"
+            else
+                log_debug "Could not activate service account (may already be active or using different auth)"
+            fi
+        fi
+    else
+        log_debug "No GOOGLE_APPLICATION_CREDENTIALS set, using default gcloud auth"
     fi
 
-    # Test bucket access
-    log_debug "Testing bucket access: gs://${GCS_BUCKET}/${GCS_PREFIX}/"
-    if ! gsutil ls "gs://${GCS_BUCKET}/${GCS_PREFIX}/" &>/dev/null; then
+    # Test bucket access (at bucket level first, then prefix)
+    log_debug "Testing bucket access: gs://${GCS_BUCKET}/"
+    local bucket_ls_output
+    bucket_ls_output=$(gsutil ls "gs://${GCS_BUCKET}/" 2>&1)
+    local bucket_ls_exit=$?
+
+    if [ $bucket_ls_exit -ne 0 ]; then
         log_error "Bucket not accessible"
         echo "    → Bucket: gs://${GCS_BUCKET}"
-        echo "    → Verify GCS_BUCKET in config/.env"
-        echo "    → Check IAM permissions: storage.objects.list"
+        log_debug "gsutil error: ${bucket_ls_output}"
+
+        # Provide specific error guidance
+        if echo "${bucket_ls_output}" | grep -qi "AccessDeniedException\|403"; then
+            echo "    → Access denied. Check IAM permissions for the service account"
+            echo "    → Required permission: storage.objects.list on the bucket"
+        elif echo "${bucket_ls_output}" | grep -qi "BucketNotFoundException\|404\|NoSuchBucket"; then
+            echo "    → Bucket does not exist. Verify GCS_BUCKET in config/.env"
+        elif echo "${bucket_ls_output}" | grep -qi "invalid_grant\|Could not authenticate"; then
+            echo "    → Authentication failed. Check GOOGLE_APPLICATION_CREDENTIALS"
+            echo "    → Or try: gcloud auth application-default login"
+        else
+            echo "    → Verify GCS_BUCKET in config/.env"
+            echo "    → Check IAM permissions: storage.objects.list"
+            if [ -n "${bucket_ls_output}" ]; then
+                echo "    → Error details: ${bucket_ls_output}"
+            fi
+        fi
         return 1
     fi
-    log_success "Bucket accessible: gs://${GCS_BUCKET}/${GCS_PREFIX}/"
+    log_success "Bucket accessible: gs://${GCS_BUCKET}/"
+
+    # Test prefix path if specified (informational only, not a failure)
+    if [ -n "${GCS_PREFIX:-}" ]; then
+        log_debug "Checking prefix path: gs://${GCS_BUCKET}/${GCS_PREFIX}/"
+        if gsutil ls "gs://${GCS_BUCKET}/${GCS_PREFIX}/" &>/dev/null; then
+            log_success "Prefix path exists: gs://${GCS_BUCKET}/${GCS_PREFIX}/"
+        else
+            log_debug "Prefix path does not exist yet (will be created on first upload)"
+        fi
+    fi
 
     # Test write permissions
     log_debug "Testing write permissions: ${gcs_uri}"

@@ -8,7 +8,9 @@
       "Bash(docker compose run:*)",
       "Bash(docker volume create:*)",
       "Bash(docker run:*)",
-      "Bash(docker compose:*)"
+      "Bash(docker compose:*)",
+      "Bash(git commit -m \"$(cat <<''EOF''\nAdd macOS compatibility and document production-to-local restore\n\n- Fix Bash 4+ syntax ($var^^, $var^) for macOS Bash 3.2 compatibility\n- Replace GNU-specific find -printf with portable alternative\n- Add cross-platform stat command handling (GNU vs BSD)\n- Use MYSQL_DATA_DIR from config instead of auto-detection in restore\n- Add comprehensive documentation for restoring production backups to macOS\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-Authored-By: Claude <noreply@anthropic.com>\nEOF\n)\")",
+      "Bash(git push)"
     ],
     "deny": [],
     "ask": []

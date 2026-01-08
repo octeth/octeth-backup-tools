@@ -5,18 +5,39 @@
 # Copy to backup.conf and customize as needed
 
 # Load environment variables from .env file
-if [ -f "$(dirname "$0")/../config/.env" ]; then
-    set -a
-    source "$(dirname "$0")/../config/.env"
-    set +a
+# Determine the directory where this config file is located
+# Use BASH_SOURCE for sourced files, fall back to $0 for direct execution
+_BACKUP_CONF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+
+# Try multiple locations for .env file
+_ENV_FILE=""
+if [ -f "${_BACKUP_CONF_DIR}/.env" ]; then
+    _ENV_FILE="${_BACKUP_CONF_DIR}/.env"
+elif [ -f "${_BACKUP_CONF_DIR}/../config/.env" ]; then
+    _ENV_FILE="${_BACKUP_CONF_DIR}/../config/.env"
+elif [ -f "/opt/octeth-backup-tools/config/.env" ]; then
+    _ENV_FILE="/opt/octeth-backup-tools/config/.env"
 elif [ -f "/etc/octeth-backup/.env" ]; then
+    _ENV_FILE="/etc/octeth-backup/.env"
+fi
+
+if [ -n "${_ENV_FILE}" ] && [ -f "${_ENV_FILE}" ]; then
     set -a
-    source "/etc/octeth-backup/.env"
+    source "${_ENV_FILE}"
     set +a
 else
-    echo "Error: Configuration file not found"
-    exit 1
+    echo "Error: Configuration file (.env) not found"
+    echo "Searched locations:"
+    echo "  - ${_BACKUP_CONF_DIR}/.env"
+    echo "  - ${_BACKUP_CONF_DIR}/../config/.env"
+    echo "  - /opt/octeth-backup-tools/config/.env"
+    echo "  - /etc/octeth-backup/.env"
+    # Use return if sourced, exit if executed directly
+    return 1 2>/dev/null || exit 1
 fi
+
+# Clean up temporary variables
+unset _BACKUP_CONF_DIR _ENV_FILE
 
 # ============================================
 # Backward Compatibility
