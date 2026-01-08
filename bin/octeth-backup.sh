@@ -472,7 +472,7 @@ upload_gcs_with_gsutil() {
 
     # Set credentials if provided
     if [ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]; then
-        export GOOGLE_APPLICATION_CREDENTIALS
+        export GOOGLE_APPLICATION_CREDENTIALS="${GOOGLE_APPLICATION_CREDENTIALS}"
     fi
 
     # Set project ID via environment variable if provided
