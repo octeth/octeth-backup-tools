@@ -304,9 +304,9 @@ cleanup_gcs_with_gsutil() {
         export GOOGLE_APPLICATION_CREDENTIALS
     fi
 
-    local gsutil_opts=""
+    # Set project ID via environment variable if provided
     if [ -n "${GCS_PROJECT_ID:-}" ]; then
-        gsutil_opts="-u ${GCS_PROJECT_ID}"
+        export CLOUDSDK_CORE_PROJECT="${GCS_PROJECT_ID}"
     fi
 
     # Cleanup each backup type in GCS
@@ -330,7 +330,7 @@ cleanup_gcs_with_gsutil() {
         log_info "Cleaning up GCS ${backup_type} backups (keep last ${retention_count})"
 
         # List all backups in GCS for this type
-        local gcs_backups=($(gsutil ${gsutil_opts} ls "$gcs_prefix" 2>/dev/null | \
+        local gcs_backups=($(gsutil ls "$gcs_prefix" 2>/dev/null | \
             grep "\.tar\.gz$" | sort -r | xargs -n1 basename))
 
         local total=${#gcs_backups[@]}
@@ -350,9 +350,9 @@ cleanup_gcs_with_gsutil() {
                 log_info "[DRY RUN] Would delete from GCS: ${backup_file}"
             else
                 log_info "Deleting from GCS: ${backup_file}"
-                gsutil ${gsutil_opts} rm "$gcs_path" 2>&1 || log_warn "Failed to delete: ${backup_file}"
+                gsutil rm "$gcs_path" 2>&1 || log_warn "Failed to delete: ${backup_file}"
                 # Also delete checksum file if exists
-                gsutil ${gsutil_opts} rm "${gcs_path}.sha256" 2>&1 || true
+                gsutil rm "${gcs_path}.sha256" 2>&1 || true
             fi
         done
     done

@@ -475,18 +475,17 @@ upload_gcs_with_gsutil() {
         export GOOGLE_APPLICATION_CREDENTIALS
     fi
 
-    # Build gsutil command with optional project ID
-    local gsutil_opts=""
+    # Set project ID via environment variable if provided
     if [ -n "${GCS_PROJECT_ID:-}" ]; then
-        gsutil_opts="-u ${GCS_PROJECT_ID}"
+        export CLOUDSDK_CORE_PROJECT="${GCS_PROJECT_ID}"
     fi
 
-    if gsutil ${gsutil_opts} -h "Content-Type:application/gzip" \
+    if gsutil -h "Content-Type:application/gzip" \
         cp -v "$file" "gs://${GCS_BUCKET}/${GCS_PREFIX}/${gcs_path}" 2>&1 | tee -a "${LOG_FILE}"; then
 
         # Set storage class if specified
         if [ -n "${GCS_STORAGE_CLASS:-}" ] && [ "${GCS_STORAGE_CLASS}" != "STANDARD" ]; then
-            gsutil ${gsutil_opts} rewrite -s "${GCS_STORAGE_CLASS}" \
+            gsutil rewrite -s "${GCS_STORAGE_CLASS}" \
                 "gs://${GCS_BUCKET}/${GCS_PREFIX}/${gcs_path}" 2>&1 | tee -a "${LOG_FILE}" || true
         fi
 
