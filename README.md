@@ -933,8 +933,18 @@ echo "docker-compose.override.yml" >> .gitignore
 # Download backup from production server to ~/tmp/
 scp user@production:/var/backups/octeth/daily/octeth-backup-YYYY-MM-DD.tar.gz ~/tmp/
 
-# First, delete the previously created volume if it exists
+# Stop and remove all containers that reference the volume
+docker compose down
+
+# Delete the previously created volume if it exists
+# NOTE: This will fail silently if containers still reference it.
+# Always run 'docker compose down' first to remove all containers.
 docker volume rm oempro_mysql_data
+docker volume rm oempro_oempro_mysql_data
+
+# Verify the volume was actually removed
+docker volume inspect oempro_mysql_data
+docker volume inspect oempro_oempro_mysql_data
 
 # Extract backup into the Docker volume
 docker compose run --rm \
