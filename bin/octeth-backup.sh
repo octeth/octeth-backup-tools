@@ -240,26 +240,35 @@ perform_backup() {
     log_info "Using ${threads} parallel threads"
 
     # Determine MySQL connection method
-    # Try to get MySQL port exposed to host
     local mysql_port=$(${DOCKER_CMD} port ${MYSQL_HOST} 3306 2>/dev/null | cut -d':' -f2 | head -n1)
     local mysql_host="127.0.0.1"
 
     if [ -z "$mysql_port" ]; then
-        # Port not exposed, try to get container IP
-        mysql_host=$(${DOCKER_CMD} inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ${MYSQL_HOST} 2>/dev/null | head -n1)
-        mysql_port="3306"
+        # Port not exposed, check if container uses host network
+        local network_mode=$(${DOCKER_CMD} inspect -f '{{.HostConfig.NetworkMode}}' ${MYSQL_HOST} 2>/dev/null)
 
-        if [ -z "$mysql_host" ]; then
-            log_error "Cannot determine MySQL connection method. Ensure MySQL container is running and accessible."
-            EXIT_CODE=1
-            return 1
+        if [ "$network_mode" = "host" ]; then
+            # Host network mode - MySQL is directly on the host
+            mysql_host="127.0.0.1"
+            mysql_port="3306"
+            log_info "Connecting to MySQL via host network: ${mysql_host}:${mysql_port}"
+        else
+            # Bridge/custom network - get container IP
+            mysql_host=$(${DOCKER_CMD} inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ${MYSQL_HOST} 2>/dev/null | head -n1)
+            mysql_port="3306"
+
+            if [ -z "$mysql_host" ]; then
+                log_error "Cannot determine MySQL connection method. Ensure MySQL container is running and accessible."
+                EXIT_CODE=1
+                return 1
+            fi
+
+            log_info "Connecting to MySQL via container IP: ${mysql_host}:${mysql_port}"
         fi
-
-        log_info "Connecting to MySQL via container IP: ${mysql_host}:${mysql_port}"
     else
         log_info "Connecting to MySQL via exposed port: ${mysql_host}:${mysql_port}"
     fi
-
+    
     # Verify MySQL data directory exists
     if [ ! -d "${MYSQL_DATA_DIR}" ]; then
         log_error "MySQL data directory not found: ${MYSQL_DATA_DIR}"
