@@ -130,6 +130,24 @@ detect_ch_network() {
     return 1
 }
 
+# Resolve the ClickHouse host to an IP address reachable from the sidecar container.
+# On the default "bridge" network, container name DNS does not work, so we must
+# resolve to the container's IP address. On user-defined networks, names work fine
+# but using the IP is safe in both cases.
+resolve_ch_host() {
+    local network="$1"
+    local ch_ip
+
+    ch_ip=$(${DOCKER_CMD} inspect -f "{{(index .NetworkSettings.Networks \"${network}\").IPAddress}}" ${CH_HOST} 2>/dev/null)
+
+    if [ -n "$ch_ip" ]; then
+        echo "$ch_ip"
+    else
+        # Fallback to container name (works on user-defined networks)
+        echo "${CH_HOST}"
+    fi
+}
+
 # Run a clickhouse-backup command using either sidecar or internal mode
 run_clickhouse_backup() {
     local ch_backup_mode="${CH_BACKUP_MODE:-sidecar}"
@@ -145,10 +163,13 @@ run_clickhouse_backup() {
         local network
         network=$(detect_ch_network) || return 1
 
+        local ch_connect_host
+        ch_connect_host=$(resolve_ch_host "$network")
+
         ${DOCKER_CMD} run --rm \
             --network "$network" \
             -v "${CH_DATA_DIR}:/var/lib/clickhouse" \
-            -e CLICKHOUSE_HOST="${CH_HOST}" \
+            -e CLICKHOUSE_HOST="${ch_connect_host}" \
             -e CLICKHOUSE_PORT="${CH_NATIVE_PORT:-9000}" \
             -e CLICKHOUSE_USERNAME="${CH_USER}" \
             -e CLICKHOUSE_PASSWORD="${CH_PASSWORD:-}" \

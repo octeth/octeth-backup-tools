@@ -54,6 +54,19 @@ detect_ch_network() {
     return 1
 }
 
+resolve_ch_host() {
+    local network="$1"
+    local ch_ip
+
+    ch_ip=$(${DOCKER_CMD} inspect -f "{{(index .NetworkSettings.Networks \"${network}\").IPAddress}}" ${CH_HOST} 2>/dev/null)
+
+    if [ -n "$ch_ip" ]; then
+        echo "$ch_ip"
+    else
+        echo "${CH_HOST}"
+    fi
+}
+
 run_clickhouse_backup() {
     local ch_backup_mode="${CH_BACKUP_MODE:-sidecar}"
 
@@ -66,10 +79,13 @@ run_clickhouse_backup() {
         local network
         network=$(detect_ch_network) || return 1
 
+        local ch_connect_host
+        ch_connect_host=$(resolve_ch_host "$network")
+
         ${DOCKER_CMD} run --rm \
             --network "$network" \
             -v "${CH_DATA_DIR}:/var/lib/clickhouse" \
-            -e CLICKHOUSE_HOST="${CH_HOST}" \
+            -e CLICKHOUSE_HOST="${ch_connect_host}" \
             -e CLICKHOUSE_PORT="${CH_NATIVE_PORT:-9000}" \
             -e CLICKHOUSE_USERNAME="${CH_USER}" \
             -e CLICKHOUSE_PASSWORD="${CH_PASSWORD:-}" \
