@@ -1,19 +1,22 @@
-# Octeth MySQL Backup Tool
+# Octeth Backup Tools
 
-A professional, production-ready MySQL backup solution for Octeth using Percona XtraBackup. Designed for zero-downtime hot backups of large databases (2GB+) with intelligent retention policies and cloud storage integration (AWS S3, Google Cloud Storage, and Cloudflare R2).
+A professional, production-ready backup solution for Octeth supporting both **MySQL** and **ClickHouse** databases. Designed for zero-downtime hot backups of large databases with intelligent retention policies and cloud storage integration (AWS S3, Google Cloud Storage, and Cloudflare R2).
 
 ## Features
 
-- **Zero-Downtime Hot Backups**: Uses Percona XtraBackup for hot backups while MySQL stays online
+- **Zero-Downtime Hot Backups**: MySQL via Percona XtraBackup, ClickHouse via clickhouse-backup
+- **Multi-Database Support**: Independent backup/restore/cleanup for MySQL and ClickHouse
 - **Smart Retention Policy**: Daily (7 days) + Weekly (4 weeks) + Monthly (6 months)
 - **Cloud Storage**: Local filesystem + AWS S3, Google Cloud Storage, or Cloudflare R2
 - **Production-Ready**: Comprehensive error handling, logging, and notifications
-- **Fast & Efficient**: 70-80% less CPU usage compared to mysqldump
+- **Fast & Efficient**: Physical backups with minimal CPU and zero downtime
 - **Parallel Compression**: Supports pigz for faster compression
-- **Easy Restore**: Simple restore process with verification
+- **Easy Restore**: Simple restore process with checksum verification
 - **Automated Cleanup**: Automatic retention policy enforcement
 
-## Why XtraBackup?
+## Why Physical Backups?
+
+### MySQL: Percona XtraBackup
 
 Traditional `mysqldump` becomes impractical for large databases:
 - **mysqldump on 2GB+ database**: Hours of runtime, high CPU load, table locks
@@ -21,14 +24,25 @@ Traditional `mysqldump` becomes impractical for large databases:
 
 XtraBackup copies InnoDB data files directly and uses transaction logs to maintain consistency, making it ideal for production systems.
 
+### ClickHouse: clickhouse-backup
+
+The `clickhouse-backup` tool from Altinity is the industry standard for ClickHouse backups:
+- Uses `ALTER TABLE ... FREEZE` internally for instant, zero-lock snapshots
+- Produces physical backups of data parts (not SQL dumps)
+- Runs inside the ClickHouse Docker container
+- No downtime, no table locks, minimal I/O impact
+
 ## Architecture
 
 ```
 octeth-backup-tools/
 ├── bin/
-│   ├── octeth-backup.sh          # Main backup script
-│   ├── octeth-restore.sh         # Restore script
-│   ├── octeth-cleanup.sh         # Retention policy cleanup
+│   ├── octeth-backup.sh          # MySQL backup script (XtraBackup)
+│   ├── octeth-restore.sh         # MySQL restore script
+│   ├── octeth-cleanup.sh         # MySQL retention policy cleanup
+│   ├── octeth-ch-backup.sh       # ClickHouse backup script (clickhouse-backup)
+│   ├── octeth-ch-restore.sh      # ClickHouse restore script
+│   ├── octeth-ch-cleanup.sh      # ClickHouse retention policy cleanup
 │   └── octeth-test-storage.sh    # Cloud storage connectivity test
 ├── config/
 │   ├── .env.example              # Environment configuration template
@@ -53,28 +67,33 @@ sudo ./install.sh --wizard
 ```
 
 The installer will:
-- Check/install Percona XtraBackup 8.0
+- Check/install Percona XtraBackup 8.0 (for MySQL backups)
+- Optionally install clickhouse-backup inside the ClickHouse container
 - Install compression tools (pigz recommended)
 - Optionally install AWS CLI for S3 backups
-- Create configuration files
+- Create configuration files and backup directories
 - Set up cron jobs for automated backups
 
 ### 2. Configuration
 
-Edit `config/.env` with your MySQL credentials:
+Edit `config/.env` with your database credentials:
 
 ```bash
 # MySQL Connection
 MYSQL_HOST=oempro_mysql
 MYSQL_ROOT_PASSWORD=your_root_password
 MYSQL_DATABASE=oempro
-
-# MySQL data directory on HOST (required for XtraBackup)
-# For Octeth Docker: /opt/oempro/_dockerfiles/mysql/data_v8
 MYSQL_DATA_DIR=/opt/oempro/_dockerfiles/mysql/data_v8
 
+# ClickHouse Connection
+CH_HOST=oempro_clickhouse
+CH_USER=default
+CH_PASSWORD=
+CH_DATABASE=oempro
+
 # Backup Storage
-BACKUP_DIR=/var/backups/octeth
+BACKUP_DIR=/var/backups/octeth          # MySQL backups
+CH_BACKUP_DIR=/var/backups/octeth-ch    # ClickHouse backups
 
 # Cloud Storage (optional - choose s3, gcs, r2, or none)
 CLOUD_STORAGE_PROVIDER=s3
@@ -84,32 +103,25 @@ S3_BUCKET=my-octeth-backups
 S3_REGION=us-east-1
 AWS_ACCESS_KEY_ID=your_key
 AWS_SECRET_ACCESS_KEY=your_secret
-
-# GCS Settings (if using Google Cloud Storage)
-# GCS_BUCKET=my-octeth-backups
-# GCS_PROJECT_ID=my-project-id
-# GOOGLE_APPLICATION_CREDENTIALS=/path/to/credentials.json
-
-# R2 Settings (if using Cloudflare R2)
-# R2_BUCKET=my-octeth-backups
-# R2_ACCOUNT_ID=your-account-id
-# R2_ACCESS_KEY_ID=your_key
-# R2_SECRET_ACCESS_KEY=your_secret
 ```
 
 ### 3. First Backup
 
 ```bash
-# Run your first backup manually
+# Run your first MySQL backup
 ./bin/octeth-backup.sh
 
-# Check backup was created
+# Run your first ClickHouse backup
+./bin/octeth-ch-backup.sh
+
+# Check backups were created
 ./bin/octeth-restore.sh --list
+./bin/octeth-ch-restore.sh --list
 ```
 
 ## Usage
 
-### Backup Operations
+### MySQL Backup Operations
 
 ```bash
 # Manual backup
@@ -118,7 +130,7 @@ AWS_SECRET_ACCESS_KEY=your_secret
 # Backup runs automatically via cron (default: daily at 2 AM)
 ```
 
-The backup script automatically:
+The MySQL backup script automatically:
 1. Checks disk space and MySQL connectivity
 2. Determines backup type (daily/weekly/monthly based on date)
 3. Performs hot backup with XtraBackup
@@ -127,7 +139,7 @@ The backup script automatically:
 6. Sends notifications
 7. Logs everything
 
-### Restore Operations
+### MySQL Restore Operations
 
 ```bash
 # List available local backups
@@ -155,13 +167,13 @@ The backup script automatically:
 ./bin/octeth-restore.sh --file backup.tar.gz --yes
 ```
 
-**Warning**: Restore operations will:
+**Warning**: MySQL restore operations will:
 1. Stop the MySQL container
 2. Backup current data (safety backup)
 3. Replace MySQL data with backup
 4. Restart MySQL
 
-### Cleanup Operations
+### MySQL Cleanup Operations
 
 ```bash
 # Show backup statistics
@@ -177,7 +189,68 @@ The backup script automatically:
 ./bin/octeth-cleanup.sh --verbose
 ```
 
-Cleanup runs automatically after backups (via cron) and enforces the retention policy:
+### ClickHouse Backup Operations
+
+```bash
+# Manual backup
+./bin/octeth-ch-backup.sh
+
+# Backup runs automatically via cron (default: daily at 3 AM)
+```
+
+The ClickHouse backup script automatically:
+1. Checks disk space and ClickHouse connectivity
+2. Verifies `clickhouse-backup` is installed inside the container
+3. Determines backup type (daily/weekly/monthly based on date)
+4. Runs `clickhouse-backup create` inside the container (hot backup, zero downtime)
+5. Copies backup to host, compresses, and creates checksum
+6. Uploads to cloud storage under the `clickhouse/` sub-prefix
+7. Cleans up the raw backup inside the container
+8. Sends notifications
+
+### ClickHouse Restore Operations
+
+```bash
+# List available local backups
+./bin/octeth-ch-restore.sh --list
+
+# List cloud backups
+./bin/octeth-ch-restore.sh --list-cloud
+
+# Restore from local backup
+./bin/octeth-ch-restore.sh --file /var/backups/octeth-ch/daily/octeth-ch-backup-2025-01-15_02-00-00.tar.gz
+
+# Restore from cloud backup
+./bin/octeth-ch-restore.sh --cloud octeth-ch-backup-2025-01-15_02-00-00.tar.gz daily
+
+# Restore with drop (clean restore - drops existing tables first)
+./bin/octeth-ch-restore.sh --file backup.tar.gz --drop --yes
+
+# Force restore (skip checksum verification)
+./bin/octeth-ch-restore.sh --file backup.tar.gz --force
+```
+
+**Note**: Unlike MySQL, ClickHouse restore is an **online** operation -- the container does not need to be stopped. The `--drop` flag drops existing tables before restoring for a clean restore.
+
+### ClickHouse Cleanup Operations
+
+```bash
+# Show ClickHouse backup statistics
+./bin/octeth-ch-cleanup.sh --stats
+
+# Dry run
+./bin/octeth-ch-cleanup.sh --dry-run
+
+# Perform cleanup
+./bin/octeth-ch-cleanup.sh
+
+# Verbose output
+./bin/octeth-ch-cleanup.sh --verbose
+```
+
+### Shared Retention Policy
+
+Both MySQL and ClickHouse cleanup scripts enforce the same retention policy:
 - **Daily**: Keep last 7 backups
 - **Weekly**: Keep last 4 Sunday backups
 - **Monthly**: Keep last 6 first-of-month backups
@@ -198,7 +271,24 @@ MYSQL_DATA_DIR=                  # MySQL data directory on HOST (required)
                                  # For Octeth: /opt/oempro/_dockerfiles/mysql/data_v8
 ```
 
-#### Backup Storage
+#### ClickHouse Settings
+```bash
+CH_HOST=oempro_clickhouse       # ClickHouse container name
+CH_HTTP_PORT=8123               # HTTP interface port
+CH_NATIVE_PORT=9000             # Native protocol port
+CH_USER=default                 # ClickHouse user
+CH_PASSWORD=                    # ClickHouse password (empty if none)
+CH_DATABASE=oempro              # Database to backup
+CH_DATA_DIR=                    # ClickHouse data directory on HOST (optional)
+                                # If set, backups are read directly from the volume
+                                # If empty, uses docker cp (slower but always works)
+CH_BACKUP_DIR=/var/backups/octeth-ch  # ClickHouse backup directory
+CH_TEMP_DIR=/var/backups/octeth-ch/tmp # ClickHouse temp directory
+CH_LOCK_FILE=/tmp/octeth-ch-backup.lock # Lock file
+CH_LOG_FILE=/var/log/octeth-ch-backup.log # Log file
+```
+
+#### Backup Storage (MySQL)
 ```bash
 BACKUP_DIR=/var/backups/octeth      # Local backup directory
 TEMP_DIR=/var/backups/octeth/tmp    # Temporary directory (CRITICAL: needs DB size + 20% free space)
@@ -290,13 +380,17 @@ BACKUP_TIMEOUT=120               # Backup timeout in minutes
 
 ## Backup Types & Retention
 
-The tool automatically determines backup type based on the current date:
+Both tools automatically determine backup type based on the current date:
 
-| Type | When | Retention | Storage Path |
-|------|------|-----------|--------------|
-| **Monthly** | 1st of month | 6 months | `/var/backups/octeth/monthly/` |
-| **Weekly** | Sunday | 4 weeks | `/var/backups/octeth/weekly/` |
-| **Daily** | All other days | 7 days | `/var/backups/octeth/daily/` |
+| Type | When | Retention | MySQL Path | ClickHouse Path |
+|------|------|-----------|------------|-----------------|
+| **Monthly** | 1st of month | 6 months | `/var/backups/octeth/monthly/` | `/var/backups/octeth-ch/monthly/` |
+| **Weekly** | Sunday | 4 weeks | `/var/backups/octeth/weekly/` | `/var/backups/octeth-ch/weekly/` |
+| **Daily** | All other days | 7 days | `/var/backups/octeth/daily/` | `/var/backups/octeth-ch/daily/` |
+
+Cloud storage paths:
+- MySQL: `s3://bucket/octeth/daily/octeth-backup-*.tar.gz`
+- ClickHouse: `s3://bucket/octeth/clickhouse/daily/octeth-ch-backup-*.tar.gz`
 
 ### Example Timeline
 
@@ -512,17 +606,16 @@ Webhook payload:
 
 ### Log Files
 
-All operations are logged to `/var/log/octeth-backup.log`:
+Operations are logged to separate files per engine:
 
 ```bash
-# View recent logs
+# MySQL logs
 tail -f /var/log/octeth-backup.log
-
-# Search for errors
 grep ERROR /var/log/octeth-backup.log
 
-# View backup history
-grep "Backup completed" /var/log/octeth-backup.log
+# ClickHouse logs
+tail -f /var/log/octeth-ch-backup.log
+grep ERROR /var/log/octeth-ch-backup.log
 ```
 
 Logs are automatically rotated and cleaned up after 30 days.
@@ -532,11 +625,17 @@ Logs are automatically rotated and cleaned up after 30 days.
 The installer creates cron jobs automatically:
 
 ```cron
-# Backup at 2 AM daily
+# MySQL backup at 2 AM daily
 0 2 * * * /path/to/octeth-backup-tools/bin/octeth-backup.sh
 
-# Cleanup at 2:30 AM daily
+# MySQL cleanup at 2:30 AM daily
 30 2 * * * /path/to/octeth-backup-tools/bin/octeth-cleanup.sh
+
+# ClickHouse backup at 3 AM daily
+0 3 * * * /path/to/octeth-backup-tools/bin/octeth-ch-backup.sh
+
+# ClickHouse cleanup at 3:30 AM daily
+30 3 * * * /path/to/octeth-backup-tools/bin/octeth-ch-cleanup.sh
 ```
 
 ### Custom Schedule
@@ -738,11 +837,61 @@ sha256sum -c backup.tar.gz.sha256
 ### Lock File Issues
 
 ```bash
-# Remove stale lock file
+# Remove stale MySQL lock file
 rm -f /tmp/octeth-backup.lock
+
+# Remove stale ClickHouse lock file
+rm -f /tmp/octeth-ch-backup.lock
 
 # Check for running backup processes
 ps aux | grep octeth-backup
+ps aux | grep octeth-ch-backup
+```
+
+### ClickHouse: "clickhouse-backup not found"
+
+`clickhouse-backup` must be installed **inside** the ClickHouse container:
+
+```bash
+# Check if it's installed
+docker exec oempro_clickhouse clickhouse-backup --version
+
+# Install it (auto-detects architecture)
+docker exec oempro_clickhouse bash -c \
+  "curl -sL https://github.com/Altinity/clickhouse-backup/releases/latest/download/clickhouse-backup-linux-amd64.tar.gz | \
+   tar xz -C /tmp && mv /tmp/build/linux/*/clickhouse-backup /usr/local/bin/ && chmod +x /usr/local/bin/clickhouse-backup"
+
+# Or run the installer
+sudo ./install.sh --deps-only
+```
+
+**Note**: If your container is rebuilt (e.g., via `docker compose up --build`), you'll need to reinstall `clickhouse-backup`. Consider adding it to your Dockerfile or using a custom image.
+
+### ClickHouse: "Cannot connect to ClickHouse server"
+
+```bash
+# Check container is running
+docker ps | grep clickhouse
+
+# Test connection
+docker exec oempro_clickhouse clickhouse-client --query "SELECT 1"
+
+# If password is set
+docker exec oempro_clickhouse clickhouse-client --user=default --password=your_password --query "SELECT 1"
+
+# Verify CH_HOST and CH_USER in config/.env
+```
+
+### ClickHouse: Backup files not accessible on host
+
+If `CH_DATA_DIR` is not set, backups are copied from the container via `docker cp` (slower but always works). For better performance:
+
+```bash
+# Find the ClickHouse data volume mount
+docker inspect oempro_clickhouse | grep -A5 "Mounts"
+
+# Set CH_DATA_DIR in config/.env to the host path
+CH_DATA_DIR=/opt/oempro/_dockerfiles/clickhouse/data
 ```
 
 ## Security Considerations
@@ -780,10 +929,10 @@ ps aux | grep octeth-backup
 
 This tool integrates seamlessly with Octeth:
 
-1. **Automatic MySQL detection**: Connects to `oempro_mysql` container
+1. **Automatic container detection**: Connects to `oempro_mysql` and `oempro_clickhouse` containers
 2. **Respects Docker network**: Uses existing Octeth Docker network
-3. **No service disruption**: Zero downtime backups
-4. **Compatible with all Octeth versions**: Works with v5.7.1+
+3. **No service disruption**: Zero downtime backups for both databases
+4. **Independent operation**: MySQL and ClickHouse backups run independently with separate lock files
 
 You can also integrate with Octeth's CLI:
 
@@ -798,7 +947,7 @@ ln -s /path/to/octeth-backup-tools/bin/octeth-backup.sh cli/backup.sh
 
 ## Testing
 
-### Test Backup
+### Test MySQL Backup
 
 ```bash
 # Run backup manually
@@ -811,27 +960,46 @@ ln -s /path/to/octeth-backup-tools/bin/octeth-backup.sh cli/backup.sh
 tail -50 /var/log/octeth-backup.log
 ```
 
+### Test ClickHouse Backup
+
+```bash
+# Run backup manually
+./bin/octeth-ch-backup.sh
+
+# Verify backup exists
+./bin/octeth-ch-restore.sh --list
+
+# Check logs
+tail -50 /var/log/octeth-ch-backup.log
+```
+
 ### Test Restore (Non-Production Only!)
 
 ```bash
 # DANGER: Only test restore in development/staging!
-# This will replace your database!
 
-# List backups
-./bin/octeth-restore.sh --list
-
-# Restore
+# MySQL restore (stops and restarts container)
 ./bin/octeth-restore.sh --file /var/backups/octeth/daily/octeth-backup-YYYY-MM-DD.tar.gz --yes
+
+# ClickHouse restore (online, no downtime)
+./bin/octeth-ch-restore.sh --file /var/backups/octeth-ch/daily/octeth-ch-backup-YYYY-MM-DD.tar.gz --yes
+
+# ClickHouse clean restore (drops tables first)
+./bin/octeth-ch-restore.sh --file backup.tar.gz --drop --yes
 ```
 
 ### Test Cleanup
 
 ```bash
-# Dry run to see what would be deleted
+# MySQL dry run
 ./bin/octeth-cleanup.sh --dry-run
+
+# ClickHouse dry run
+./bin/octeth-ch-cleanup.sh --dry-run
 
 # View statistics
 ./bin/octeth-cleanup.sh --stats
+./bin/octeth-ch-cleanup.sh --stats
 ```
 
 ### Test Cloud Storage Connectivity
@@ -998,13 +1166,16 @@ Note: mysqldump is slower and causes brief locks, but produces platform-independ
 ## FAQ
 
 ### Q: Does this cause downtime?
-**A:** No. XtraBackup performs hot backups with zero downtime. MySQL stays online and applications continue running.
+**A:** No. Both XtraBackup (MySQL) and clickhouse-backup (ClickHouse) perform hot backups with zero downtime.
 
 ### Q: How long does a backup take?
-**A:** For a 2GB database: 5-15 minutes. Larger databases scale linearly.
+**A:** For a 2GB MySQL database: 5-15 minutes. ClickHouse is typically faster due to its columnar storage. Larger databases scale linearly.
+
+### Q: Can I run MySQL and ClickHouse backups at the same time?
+**A:** Yes. They use separate lock files, log files, and backup directories. They can run concurrently without conflict.
 
 ### Q: Can I run backups more frequently?
-**A:** Yes. Modify the cron schedule. XtraBackup is efficient enough for hourly backups if needed.
+**A:** Yes. Modify the cron schedule. Both tools are efficient enough for hourly backups if needed.
 
 ### Q: What happens if backup fails?
 **A:** The script logs errors, sends notifications (if configured), and exits without affecting your database.
@@ -1013,10 +1184,13 @@ Note: mysqldump is slower and causes brief locks, but produces platform-independ
 **A:** Yes. Copy the backup file to the new server and run the restore script.
 
 ### Q: How much disk space do I need?
-**A:** Plan for ~17x your compressed backup size for local retention (7 daily + 4 weekly + 6 monthly).
+**A:** Plan for ~17x your compressed backup size per database engine for local retention (7 daily + 4 weekly + 6 monthly).
 
-### Q: What if I delete a backup by mistake?
-**A:** If S3 is enabled, download from S3. Otherwise, backups are gone. Enable S3 for redundancy.
+### Q: Does ClickHouse restore require downtime?
+**A:** No. ClickHouse restore is an online operation. The `--drop` flag drops existing tables first for a clean restore, but the ClickHouse server stays running throughout.
+
+### Q: What if clickhouse-backup is lost when the container is rebuilt?
+**A:** You'll need to reinstall it. Consider adding it to your Dockerfile or running `install.sh --deps-only` after container rebuild.
 
 ### Q: Can I encrypt backups?
 **A:** Currently not built-in. You can add GPG encryption by modifying the backup script or use S3 server-side encryption.
@@ -1033,6 +1207,16 @@ For issues, questions, or contributions:
 - Octeth Support: support@octeth.com
 
 ## Changelog
+
+### v1.1.0 (2026-03-16)
+- ClickHouse backup support using clickhouse-backup (Altinity)
+- New scripts: `octeth-ch-backup.sh`, `octeth-ch-restore.sh`, `octeth-ch-cleanup.sh`
+- ClickHouse online restore (no downtime, no container restart)
+- ClickHouse `--drop` flag for clean restores
+- Separate backup directories and log files for each database engine
+- Cloud storage uses `/clickhouse/` sub-prefix for ClickHouse backups
+- Installer supports clickhouse-backup detection and installation
+- Updated documentation for multi-database support
 
 ### v1.0.0 (2025-01-21)
 - Initial release
