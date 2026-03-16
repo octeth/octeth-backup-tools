@@ -20,6 +20,14 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # ============================================
+# Global Variables
+# ============================================
+
+ENABLE_MYSQL=false
+ENABLE_CLICKHOUSE=false
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ============================================
 # Logging Functions
 # ============================================
 
@@ -65,6 +73,54 @@ detect_package_manager() {
         echo "dnf"
     else
         echo "unknown"
+    fi
+}
+
+# ============================================
+# Engine Selection
+# ============================================
+
+select_engines() {
+    # If engines were already set via CLI flags, skip the prompt
+    if [ "$ENABLE_MYSQL" = true ] || [ "$ENABLE_CLICKHOUSE" = true ]; then
+        return 0
+    fi
+
+    echo ""
+    log_info "Which database engines do you want to back up?"
+    echo ""
+    echo "  1) MySQL only"
+    echo "  2) ClickHouse only"
+    echo "  3) Both MySQL and ClickHouse"
+    echo ""
+    read -p "Select [1-3]: " engine_choice
+
+    case "$engine_choice" in
+        1)
+            ENABLE_MYSQL=true
+            ENABLE_CLICKHOUSE=false
+            ;;
+        2)
+            ENABLE_MYSQL=false
+            ENABLE_CLICKHOUSE=true
+            ;;
+        3)
+            ENABLE_MYSQL=true
+            ENABLE_CLICKHOUSE=true
+            ;;
+        *)
+            log_error "Invalid choice: $engine_choice"
+            exit 1
+            ;;
+    esac
+
+    echo ""
+    if [ "$ENABLE_MYSQL" = true ] && [ "$ENABLE_CLICKHOUSE" = true ]; then
+        log_info "Selected: MySQL + ClickHouse"
+    elif [ "$ENABLE_MYSQL" = true ]; then
+        log_info "Selected: MySQL only"
+    else
+        log_info "Selected: ClickHouse only"
     fi
 }
 
@@ -263,9 +319,8 @@ check_clickhouse_backup() {
 
     # Read CH_HOST from .env if available
     local ch_host="oempro_clickhouse"
-    local script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    if [ -f "${script_dir}/config/.env" ]; then
-        local env_ch_host=$(grep "^CH_HOST=" "${script_dir}/config/.env" | cut -d'=' -f2)
+    if [ -f "${SCRIPT_DIR}/config/.env" ]; then
+        local env_ch_host=$(grep "^CH_HOST=" "${SCRIPT_DIR}/config/.env" | cut -d'=' -f2)
         if [ -n "$env_ch_host" ]; then
             ch_host="$env_ch_host"
         fi
@@ -289,9 +344,8 @@ check_clickhouse_backup() {
 
 install_clickhouse_backup_in_container() {
     local ch_host="oempro_clickhouse"
-    local script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    if [ -f "${script_dir}/config/.env" ]; then
-        local env_ch_host=$(grep "^CH_HOST=" "${script_dir}/config/.env" | cut -d'=' -f2)
+    if [ -f "${SCRIPT_DIR}/config/.env" ]; then
+        local env_ch_host=$(grep "^CH_HOST=" "${SCRIPT_DIR}/config/.env" | cut -d'=' -f2)
         if [ -n "$env_ch_host" ]; then
             ch_host="$env_ch_host"
         fi
@@ -336,13 +390,17 @@ install_clickhouse_backup_in_container() {
 setup_configuration() {
     log_info "Setting up configuration files..."
 
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
     # Copy .env file if it doesn't exist
     if [ ! -f "${SCRIPT_DIR}/config/.env" ]; then
         cp "${SCRIPT_DIR}/config/.env.example" "${SCRIPT_DIR}/config/.env"
         log_success "Created config/.env from example"
-        log_warn "Please edit config/.env with your MySQL credentials"
+        if [ "$ENABLE_MYSQL" = true ] && [ "$ENABLE_CLICKHOUSE" = true ]; then
+            log_warn "Please edit config/.env with your MySQL and ClickHouse credentials"
+        elif [ "$ENABLE_MYSQL" = true ]; then
+            log_warn "Please edit config/.env with your MySQL credentials"
+        else
+            log_warn "Please edit config/.env with your ClickHouse credentials"
+        fi
     else
         log_info "config/.env already exists"
     fi
@@ -357,66 +415,80 @@ setup_configuration() {
 
     # Create necessary directories
     log_info "Creating directories..."
-
-    # Read BACKUP_DIR from .env if it exists
-    local backup_dir="/var/backups/octeth"
-    if [ -f "${SCRIPT_DIR}/config/.env" ]; then
-        backup_dir=$(grep "^BACKUP_DIR=" "${SCRIPT_DIR}/config/.env" | cut -d'=' -f2)
-    fi
-
-    sudo mkdir -p "$backup_dir"/{daily,weekly,monthly}
     sudo mkdir -p /var/log
-    sudo touch /var/log/octeth-backup.log
-    sudo chmod 666 /var/log/octeth-backup.log
 
-    # Create ClickHouse backup directories if configured
-    local ch_backup_dir="/var/backups/octeth-ch"
-    if [ -f "${SCRIPT_DIR}/config/.env" ]; then
-        local env_ch_dir=$(grep "^CH_BACKUP_DIR=" "${SCRIPT_DIR}/config/.env" | cut -d'=' -f2)
-        if [ -n "$env_ch_dir" ]; then
-            ch_backup_dir="$env_ch_dir"
+    # MySQL directories
+    if [ "$ENABLE_MYSQL" = true ]; then
+        local backup_dir="/var/backups/octeth"
+        if [ -f "${SCRIPT_DIR}/config/.env" ]; then
+            local env_dir=$(grep "^BACKUP_DIR=" "${SCRIPT_DIR}/config/.env" | cut -d'=' -f2)
+            if [ -n "$env_dir" ]; then
+                backup_dir="$env_dir"
+            fi
         fi
+
+        sudo mkdir -p "$backup_dir"/{daily,weekly,monthly}
+        sudo touch /var/log/octeth-backup.log
+        sudo chmod 666 /var/log/octeth-backup.log
+        log_success "MySQL backup directories created: $backup_dir"
     fi
 
-    sudo mkdir -p "$ch_backup_dir"/{daily,weekly,monthly}
-    sudo touch /var/log/octeth-ch-backup.log
-    sudo chmod 666 /var/log/octeth-ch-backup.log
+    # ClickHouse directories
+    if [ "$ENABLE_CLICKHOUSE" = true ]; then
+        local ch_backup_dir="/var/backups/octeth-ch"
+        if [ -f "${SCRIPT_DIR}/config/.env" ]; then
+            local env_ch_dir=$(grep "^CH_BACKUP_DIR=" "${SCRIPT_DIR}/config/.env" | cut -d'=' -f2)
+            if [ -n "$env_ch_dir" ]; then
+                ch_backup_dir="$env_ch_dir"
+            fi
+        fi
 
-    log_success "Directories created"
+        sudo mkdir -p "$ch_backup_dir"/{daily,weekly,monthly}
+        sudo touch /var/log/octeth-ch-backup.log
+        sudo chmod 666 /var/log/octeth-ch-backup.log
+        log_success "ClickHouse backup directories created: $ch_backup_dir"
+    fi
 }
 
 # ============================================
 # Cron Setup
 # ============================================
 
-setup_cron() {
-    local script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/bin/octeth-backup.sh"
+setup_cron_for_engine() {
+    local engine="$1"
+    local backup_script="$2"
+    local cleanup_script="$3"
+    local log_file="$4"
+    local default_backup_time="$5"
+    local default_cleanup_time="$6"
 
-    log_info "Setting up cron job..."
+    log_info "Setting up ${engine} cron jobs..."
+
+    local backup_script_name=$(basename "$backup_script")
+    local cleanup_script_name=$(basename "$cleanup_script")
 
     # Check if cron job already exists
     local existing_cron=""
     if crontab -l >/dev/null 2>&1; then
-        existing_cron=$(crontab -l 2>/dev/null | grep "octeth-backup.sh" || true)
+        existing_cron=$(crontab -l 2>/dev/null | grep "$backup_script_name" || true)
     fi
 
     if [ -n "$existing_cron" ]; then
-        log_info "Found existing cron job:"
+        log_info "Found existing ${engine} cron job:"
         echo "  $existing_cron"
         read -p "Do you want to replace it? (y/n): " replace_cron
         if [ "$replace_cron" != "y" ] && [ "$replace_cron" != "Y" ]; then
-            log_info "Keeping existing cron job"
+            log_info "Keeping existing ${engine} cron job"
             return 0
         fi
-        # Remove existing octeth-backup.sh entries
-        crontab -l 2>/dev/null | grep -v "octeth-backup.sh" | crontab - || true
+        # Remove existing entries for this engine
+        crontab -l 2>/dev/null | grep -v "$backup_script_name" | grep -v "$cleanup_script_name" | crontab - || true
     fi
 
-    # Default: Run daily at 2 AM
-    local cron_schedule="0 2 * * *"
+    local cron_schedule="$default_backup_time"
 
     echo ""
-    log_info "Default schedule: Daily at 2:00 AM"
+    log_info "Default ${engine} backup schedule: ${default_backup_time} (cron format)"
     read -p "Do you want to use the default schedule? (y/n): " use_default
 
     if [ "$use_default" != "y" ] && [ "$use_default" != "Y" ]; then
@@ -427,40 +499,57 @@ setup_cron() {
         echo "  0 */6 * * *   - Every 6 hours"
         echo "  0 3 * * 0     - Weekly on Sunday at 3:00 AM"
         echo ""
-        read -p "Enter cron schedule: " cron_schedule
+        read -p "Enter cron schedule for ${engine} backup: " cron_schedule
     fi
 
-    # Add cron job
-    (crontab -l 2>/dev/null || true; echo "$cron_schedule $script_path >> /var/log/octeth-backup.log 2>&1") | crontab -
+    # Add backup cron job
+    (crontab -l 2>/dev/null || true; echo "$cron_schedule $backup_script >> $log_file 2>&1") | crontab -
 
-    # Verify the cron job was added
-    if crontab -l 2>/dev/null | grep -q "octeth-backup.sh"; then
-        log_success "Cron job added: $cron_schedule"
+    if crontab -l 2>/dev/null | grep -q "$backup_script_name"; then
+        log_success "${engine} backup cron job added: $cron_schedule"
     else
-        log_error "Failed to add cron job"
+        log_error "Failed to add ${engine} backup cron job"
         return 1
     fi
 
-    # Also add cleanup job (run after backup)
-    local cleanup_schedule="30 2 * * *"  # 30 minutes after backup
-    local cleanup_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/bin/octeth-cleanup.sh"
-
+    # Add cleanup job
     local existing_cleanup=""
     if crontab -l >/dev/null 2>&1; then
-        existing_cleanup=$(crontab -l 2>/dev/null | grep "octeth-cleanup.sh" || true)
+        existing_cleanup=$(crontab -l 2>/dev/null | grep "$cleanup_script_name" || true)
     fi
 
     if [ -z "$existing_cleanup" ]; then
-        (crontab -l 2>/dev/null || true; echo "$cleanup_schedule $cleanup_path >> /var/log/octeth-backup.log 2>&1") | crontab -
+        (crontab -l 2>/dev/null || true; echo "$default_cleanup_time $cleanup_script >> $log_file 2>&1") | crontab -
 
-        # Verify cleanup job was added
-        if crontab -l 2>/dev/null | grep -q "octeth-cleanup.sh"; then
-            log_success "Cleanup cron job added: $cleanup_schedule"
+        if crontab -l 2>/dev/null | grep -q "$cleanup_script_name"; then
+            log_success "${engine} cleanup cron job added: $default_cleanup_time"
         else
-            log_warn "Failed to add cleanup cron job"
+            log_warn "Failed to add ${engine} cleanup cron job"
         fi
     else
-        log_info "Cleanup cron job already exists"
+        log_info "${engine} cleanup cron job already exists"
+    fi
+}
+
+setup_cron() {
+    if [ "$ENABLE_MYSQL" = true ]; then
+        setup_cron_for_engine \
+            "MySQL" \
+            "${SCRIPT_DIR}/bin/octeth-backup.sh" \
+            "${SCRIPT_DIR}/bin/octeth-cleanup.sh" \
+            "/var/log/octeth-backup.log" \
+            "0 2 * * *" \
+            "30 2 * * *"
+    fi
+
+    if [ "$ENABLE_CLICKHOUSE" = true ]; then
+        setup_cron_for_engine \
+            "ClickHouse" \
+            "${SCRIPT_DIR}/bin/octeth-ch-backup.sh" \
+            "${SCRIPT_DIR}/bin/octeth-ch-cleanup.sh" \
+            "/var/log/octeth-ch-backup.log" \
+            "0 3 * * *" \
+            "30 3 * * *"
     fi
 }
 
@@ -473,44 +562,189 @@ run_config_wizard() {
     log_info "Configuration Wizard"
     log_info "=========================================="
 
-    local env_file="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/config/.env"
+    local env_file="${SCRIPT_DIR}/config/.env"
 
-    # MySQL settings
-    echo ""
-    read -p "MySQL container name [oempro_mysql]: " mysql_host
-    mysql_host=${mysql_host:-oempro_mysql}
-    sed -i "s/^MYSQL_HOST=.*/MYSQL_HOST=$mysql_host/" "$env_file"
-
-    read -p "MySQL root password: " -s mysql_root_password
-    echo ""
-    sed -i "s/^MYSQL_ROOT_PASSWORD=.*/MYSQL_ROOT_PASSWORD=$mysql_root_password/" "$env_file"
-
-    read -p "MySQL database name [oempro]: " mysql_database
-    mysql_database=${mysql_database:-oempro}
-    sed -i "s/^MYSQL_DATABASE=.*/MYSQL_DATABASE=$mysql_database/" "$env_file"
-
-    # S3 settings
-    echo ""
-    read -p "Enable S3 backups? (y/n) [n]: " enable_s3
-    if [ "$enable_s3" = "y" ] || [ "$enable_s3" = "Y" ]; then
-        sed -i "s/^S3_UPLOAD_ENABLED=.*/S3_UPLOAD_ENABLED=true/" "$env_file"
-
-        read -p "S3 bucket name: " s3_bucket
-        sed -i "s/^S3_BUCKET=.*/S3_BUCKET=$s3_bucket/" "$env_file"
-
-        read -p "S3 region [us-east-1]: " s3_region
-        s3_region=${s3_region:-us-east-1}
-        sed -i "s/^S3_REGION=.*/S3_REGION=$s3_region/" "$env_file"
-
-        read -p "AWS Access Key ID: " aws_access_key
-        sed -i "s/^AWS_ACCESS_KEY_ID=.*/AWS_ACCESS_KEY_ID=$aws_access_key/" "$env_file"
-
-        read -p "AWS Secret Access Key: " -s aws_secret_key
-        echo ""
-        sed -i "s|^AWS_SECRET_ACCESS_KEY=.*|AWS_SECRET_ACCESS_KEY=$aws_secret_key|" "$env_file"
+    if [ ! -f "$env_file" ]; then
+        cp "${SCRIPT_DIR}/config/.env.example" "$env_file"
     fi
 
+    # MySQL settings
+    if [ "$ENABLE_MYSQL" = true ]; then
+        echo ""
+        log_info "--- MySQL Configuration ---"
+        echo ""
+
+        read -p "MySQL container name [oempro_mysql]: " mysql_host
+        mysql_host=${mysql_host:-oempro_mysql}
+        sed -i "s/^MYSQL_HOST=.*/MYSQL_HOST=$mysql_host/" "$env_file"
+
+        read -p "MySQL root password: " -s mysql_root_password
+        echo ""
+        sed -i "s/^MYSQL_ROOT_PASSWORD=.*/MYSQL_ROOT_PASSWORD=$mysql_root_password/" "$env_file"
+
+        read -p "MySQL database name [oempro]: " mysql_database
+        mysql_database=${mysql_database:-oempro}
+        sed -i "s/^MYSQL_DATABASE=.*/MYSQL_DATABASE=$mysql_database/" "$env_file"
+
+        read -p "MySQL data directory on host [/opt/oempro/_dockerfiles/mysql/data_v8]: " mysql_data_dir
+        mysql_data_dir=${mysql_data_dir:-/opt/oempro/_dockerfiles/mysql/data_v8}
+        sed -i "s|^MYSQL_DATA_DIR=.*|MYSQL_DATA_DIR=$mysql_data_dir|" "$env_file"
+    fi
+
+    # ClickHouse settings
+    if [ "$ENABLE_CLICKHOUSE" = true ]; then
+        echo ""
+        log_info "--- ClickHouse Configuration ---"
+        echo ""
+
+        read -p "ClickHouse container name [oempro_clickhouse]: " ch_host
+        ch_host=${ch_host:-oempro_clickhouse}
+        sed -i "s/^CH_HOST=.*/CH_HOST=$ch_host/" "$env_file"
+
+        read -p "ClickHouse user [default]: " ch_user
+        ch_user=${ch_user:-default}
+        sed -i "s/^CH_USER=.*/CH_USER=$ch_user/" "$env_file"
+
+        read -p "ClickHouse password (leave empty for none): " -s ch_password
+        echo ""
+        sed -i "s/^CH_PASSWORD=.*/CH_PASSWORD=$ch_password/" "$env_file"
+
+        read -p "ClickHouse database name [oempro]: " ch_database
+        ch_database=${ch_database:-oempro}
+        sed -i "s/^CH_DATABASE=.*/CH_DATABASE=$ch_database/" "$env_file"
+
+        read -p "ClickHouse data directory on host (leave empty to use docker cp): " ch_data_dir
+        sed -i "s|^CH_DATA_DIR=.*|CH_DATA_DIR=$ch_data_dir|" "$env_file"
+    fi
+
+    # Cloud storage settings
+    echo ""
+    log_info "--- Cloud Storage Configuration ---"
+    echo ""
+    read -p "Enable cloud storage backups? (y/n) [n]: " enable_cloud
+    if [ "$enable_cloud" = "y" ] || [ "$enable_cloud" = "Y" ]; then
+        echo ""
+        echo "  1) AWS S3"
+        echo "  2) Google Cloud Storage"
+        echo "  3) Cloudflare R2"
+        echo ""
+        read -p "Select cloud provider [1-3]: " cloud_choice
+
+        case "$cloud_choice" in
+            1)
+                sed -i "s/^CLOUD_STORAGE_PROVIDER=.*/CLOUD_STORAGE_PROVIDER=s3/" "$env_file"
+
+                read -p "S3 bucket name: " s3_bucket
+                sed -i "s/^S3_BUCKET=.*/S3_BUCKET=$s3_bucket/" "$env_file"
+
+                read -p "S3 region [us-east-1]: " s3_region
+                s3_region=${s3_region:-us-east-1}
+                sed -i "s/^S3_REGION=.*/S3_REGION=$s3_region/" "$env_file"
+
+                read -p "AWS Access Key ID: " aws_access_key
+                sed -i "s/^AWS_ACCESS_KEY_ID=.*/AWS_ACCESS_KEY_ID=$aws_access_key/" "$env_file"
+
+                read -p "AWS Secret Access Key: " -s aws_secret_key
+                echo ""
+                sed -i "s|^AWS_SECRET_ACCESS_KEY=.*|AWS_SECRET_ACCESS_KEY=$aws_secret_key|" "$env_file"
+                ;;
+            2)
+                sed -i "s/^CLOUD_STORAGE_PROVIDER=.*/CLOUD_STORAGE_PROVIDER=gcs/" "$env_file"
+
+                read -p "GCS bucket name: " gcs_bucket
+                sed -i "s/^GCS_BUCKET=.*/GCS_BUCKET=$gcs_bucket/" "$env_file"
+
+                read -p "GCS project ID (optional): " gcs_project
+                sed -i "s/^GCS_PROJECT_ID=.*/GCS_PROJECT_ID=$gcs_project/" "$env_file"
+
+                read -p "Path to service account JSON (optional): " gcs_creds
+                sed -i "s|^GOOGLE_APPLICATION_CREDENTIALS=.*|GOOGLE_APPLICATION_CREDENTIALS=$gcs_creds|" "$env_file"
+                ;;
+            3)
+                sed -i "s/^CLOUD_STORAGE_PROVIDER=.*/CLOUD_STORAGE_PROVIDER=r2/" "$env_file"
+
+                read -p "R2 bucket name: " r2_bucket
+                sed -i "s/^R2_BUCKET=.*/R2_BUCKET=$r2_bucket/" "$env_file"
+
+                read -p "R2 account ID: " r2_account
+                sed -i "s/^R2_ACCOUNT_ID=.*/R2_ACCOUNT_ID=$r2_account/" "$env_file"
+
+                read -p "R2 Access Key ID: " r2_access_key
+                sed -i "s/^R2_ACCESS_KEY_ID=.*/R2_ACCESS_KEY_ID=$r2_access_key/" "$env_file"
+
+                read -p "R2 Secret Access Key: " -s r2_secret_key
+                echo ""
+                sed -i "s|^R2_SECRET_ACCESS_KEY=.*|R2_SECRET_ACCESS_KEY=$r2_secret_key|" "$env_file"
+                ;;
+        esac
+    fi
+
+    echo ""
     log_success "Configuration saved to $env_file"
+}
+
+# ============================================
+# Install Dependencies
+# ============================================
+
+install_dependencies() {
+    log_info "Checking dependencies..."
+    echo ""
+
+    check_docker || exit 1
+
+    # MySQL dependencies
+    if [ "$ENABLE_MYSQL" = true ]; then
+        echo ""
+        log_info "--- MySQL Dependencies ---"
+        if ! check_xtrabackup; then
+            read -p "Install Percona XtraBackup? (y/n): " install_xb
+            if [ "$install_xb" = "y" ] || [ "$install_xb" = "Y" ]; then
+                install_xtrabackup || exit 1
+            else
+                log_error "XtraBackup is required for MySQL backups"
+                exit 1
+            fi
+        fi
+    fi
+
+    # ClickHouse dependencies
+    if [ "$ENABLE_CLICKHOUSE" = true ]; then
+        echo ""
+        log_info "--- ClickHouse Dependencies ---"
+        if ! check_clickhouse_backup; then
+            read -p "Install clickhouse-backup inside the ClickHouse container? (y/n): " install_cb
+            if [ "$install_cb" = "y" ] || [ "$install_cb" = "Y" ]; then
+                install_clickhouse_backup_in_container || log_warn "clickhouse-backup installation failed (you can install it later)"
+            else
+                log_warn "clickhouse-backup is required for ClickHouse backups"
+                log_warn "You can install it later with: sudo ./install.sh --deps-only --clickhouse"
+            fi
+        fi
+    fi
+
+    # Shared dependencies
+    echo ""
+    log_info "--- Shared Dependencies ---"
+
+    check_compression_tools || exit 1
+
+    if ! command -v pigz &> /dev/null; then
+        read -p "Install pigz for faster compression? (recommended) (y/n): " install_pg
+        if [ "$install_pg" = "y" ] || [ "$install_pg" = "Y" ]; then
+            install_pigz
+        fi
+    fi
+
+    if ! check_aws_cli; then
+        read -p "Install AWS CLI for S3/R2 cloud backups? (optional) (y/n): " install_aws
+        if [ "$install_aws" = "y" ] || [ "$install_aws" = "Y" ]; then
+            install_aws_cli
+        fi
+    fi
+
+    echo ""
+    log_success "All required dependencies are installed"
 }
 
 # ============================================
@@ -520,7 +754,7 @@ run_config_wizard() {
 main() {
     echo ""
     log_info "=========================================="
-    log_info "Octeth Backup Tool - Installation"
+    log_info "Octeth Backup Tools - Installation"
     log_info "=========================================="
     echo ""
 
@@ -532,6 +766,14 @@ main() {
     # Parse arguments
     while [[ $# -gt 0 ]]; do
         case $1 in
+            --mysql)
+                ENABLE_MYSQL=true
+                shift
+                ;;
+            --clickhouse)
+                ENABLE_CLICKHOUSE=true
+                shift
+                ;;
             --deps-only)
                 install_deps=true
                 shift
@@ -552,78 +794,64 @@ main() {
                 cat << EOF
 Usage: $(basename $0) [OPTIONS]
 
+ENGINE SELECTION:
+    --mysql         Install MySQL backup tools only
+    --clickhouse    Install ClickHouse backup tools only
+                    (combine both flags for both engines)
+
 OPTIONS:
     --deps-only     Install dependencies only
     --config-only   Setup configuration only
     --cron-only     Setup cron jobs only
-    --wizard        Run configuration wizard
+    --wizard        Run interactive configuration wizard
     --help          Display this help message
 
-Without options, performs full installation (deps + config + cron)
+EXAMPLES:
+    # Full installation (interactive engine selection)
+    sudo ./install.sh
+
+    # MySQL only
+    sudo ./install.sh --mysql
+
+    # ClickHouse only
+    sudo ./install.sh --clickhouse
+
+    # Both engines
+    sudo ./install.sh --mysql --clickhouse
+
+    # Install only ClickHouse dependencies
+    sudo ./install.sh --deps-only --clickhouse
+
+    # Run wizard for MySQL setup
+    sudo ./install.sh --wizard --mysql
+
+Without --mysql or --clickhouse, you will be prompted to choose.
+Without other options, performs full installation (deps + config + cron).
 
 EOF
                 exit 0
                 ;;
             *)
                 log_error "Unknown option: $1"
+                log_error "Use --help for usage information"
                 exit 1
                 ;;
         esac
     done
 
-    # If no specific options, do full installation
+    # If no specific action options, do full installation
     if [ "$install_deps" = false ] && [ "$setup_config" = false ] && [ "$setup_cron_job" = false ] && [ "$run_wizard" = false ]; then
         install_deps=true
         setup_config=true
         setup_cron_job=true
     fi
 
-    # Check dependencies
+    # Prompt for engine selection if not specified via flags
+    select_engines
+
+    # Install dependencies
     if [ "$install_deps" = true ]; then
-        log_info "Checking dependencies..."
-        echo ""
-
-        check_docker || exit 1
-
-        if ! check_xtrabackup; then
-            read -p "Install Percona XtraBackup? (y/n): " install_xb
-            if [ "$install_xb" = "y" ] || [ "$install_xb" = "Y" ]; then
-                install_xtrabackup || exit 1
-            else
-                log_error "XtraBackup is required"
-                exit 1
-            fi
-        fi
-
-        check_compression_tools || exit 1
-
-        if ! command -v pigz &> /dev/null; then
-            read -p "Install pigz for faster compression? (recommended) (y/n): " install_pg
-            if [ "$install_pg" = "y" ] || [ "$install_pg" = "Y" ]; then
-                install_pigz
-            fi
-        fi
-
-        if ! check_aws_cli; then
-            read -p "Install AWS CLI for S3 backups? (optional) (y/n): " install_aws
-            if [ "$install_aws" = "y" ] || [ "$install_aws" = "Y" ]; then
-                install_aws_cli
-            fi
-        fi
-
-        # ClickHouse backup tool (optional)
-        echo ""
-        read -p "Enable ClickHouse backups? (y/n) [n]: " enable_ch
-        if [ "$enable_ch" = "y" ] || [ "$enable_ch" = "Y" ]; then
-            if ! check_clickhouse_backup; then
-                read -p "Install clickhouse-backup inside the ClickHouse container? (y/n): " install_cb
-                if [ "$install_cb" = "y" ] || [ "$install_cb" = "Y" ]; then
-                    install_clickhouse_backup_in_container
-                fi
-            fi
-        fi
-
-        log_success "All required dependencies are installed"
+        install_dependencies
         echo ""
     fi
 
@@ -641,7 +869,7 @@ EOF
 
     # Setup cron
     if [ "$setup_cron_job" = true ]; then
-        read -p "Setup cron job for automatic backups? (y/n): " setup_cron_answer
+        read -p "Setup cron jobs for automatic backups? (y/n): " setup_cron_answer
         if [ "$setup_cron_answer" = "y" ] || [ "$setup_cron_answer" = "Y" ]; then
             setup_cron
         fi
@@ -654,11 +882,30 @@ EOF
     log_success "=========================================="
     echo ""
     log_info "Next steps:"
-    echo "  1. Edit config/.env with your MySQL and/or ClickHouse credentials"
-    echo "  2. Test MySQL backup: ./bin/octeth-backup.sh"
-    echo "  3. Test ClickHouse backup: ./bin/octeth-ch-backup.sh"
-    echo "  4. List backups: ./bin/octeth-restore.sh --list"
-    echo "  5. View cleanup policy: ./bin/octeth-cleanup.sh --stats"
+    local step=1
+
+    if [ "$ENABLE_MYSQL" = true ] && [ "$ENABLE_CLICKHOUSE" = true ]; then
+        echo "  ${step}. Edit config/.env with your MySQL and ClickHouse credentials"
+        step=$((step + 1))
+    elif [ "$ENABLE_MYSQL" = true ]; then
+        echo "  ${step}. Edit config/.env with your MySQL credentials"
+        step=$((step + 1))
+    else
+        echo "  ${step}. Edit config/.env with your ClickHouse credentials"
+        step=$((step + 1))
+    fi
+
+    if [ "$ENABLE_MYSQL" = true ]; then
+        echo "  ${step}. Test MySQL backup: ./bin/octeth-backup.sh"
+        step=$((step + 1))
+    fi
+
+    if [ "$ENABLE_CLICKHOUSE" = true ]; then
+        echo "  ${step}. Test ClickHouse backup: ./bin/octeth-ch-backup.sh"
+        step=$((step + 1))
+    fi
+
+    echo "  ${step}. View cleanup policy: ./bin/octeth-cleanup.sh --stats"
     echo ""
     log_info "Documentation: See README.md"
     echo ""
