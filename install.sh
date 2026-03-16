@@ -255,6 +255,81 @@ check_rclone() {
 }
 
 # ============================================
+# ClickHouse Dependency Check Functions
+# ============================================
+
+check_clickhouse_backup() {
+    log_info "Checking clickhouse-backup..."
+
+    # Read CH_HOST from .env if available
+    local ch_host="oempro_clickhouse"
+    local script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    if [ -f "${script_dir}/config/.env" ]; then
+        local env_ch_host=$(grep "^CH_HOST=" "${script_dir}/config/.env" | cut -d'=' -f2)
+        if [ -n "$env_ch_host" ]; then
+            ch_host="$env_ch_host"
+        fi
+    fi
+
+    # Check if ClickHouse container is running
+    if ! docker ps --format '{{.Names}}' | grep -q "^${ch_host}$"; then
+        log_warn "ClickHouse container '${ch_host}' is not running (skipping clickhouse-backup check)"
+        return 1
+    fi
+
+    if docker exec "$ch_host" clickhouse-backup --version &> /dev/null; then
+        local cb_version=$(docker exec "$ch_host" clickhouse-backup --version 2>&1 | head -n1)
+        log_success "clickhouse-backup found in container: $cb_version"
+        return 0
+    else
+        log_warn "clickhouse-backup not found inside container '${ch_host}'"
+        return 1
+    fi
+}
+
+install_clickhouse_backup_in_container() {
+    local ch_host="oempro_clickhouse"
+    local script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    if [ -f "${script_dir}/config/.env" ]; then
+        local env_ch_host=$(grep "^CH_HOST=" "${script_dir}/config/.env" | cut -d'=' -f2)
+        if [ -n "$env_ch_host" ]; then
+            ch_host="$env_ch_host"
+        fi
+    fi
+
+    if ! docker ps --format '{{.Names}}' | grep -q "^${ch_host}$"; then
+        log_error "ClickHouse container '${ch_host}' is not running"
+        log_error "Start the container first, then re-run this installer"
+        return 1
+    fi
+
+    log_info "Installing clickhouse-backup in container '${ch_host}'..."
+
+    # Detect architecture inside the container
+    local arch=$(docker exec "$ch_host" uname -m 2>/dev/null)
+    local binary_suffix="linux-amd64"
+    if [ "$arch" = "aarch64" ] || [ "$arch" = "arm64" ]; then
+        binary_suffix="linux-arm64"
+    fi
+
+    if docker exec "$ch_host" bash -c "
+        curl -sL https://github.com/Altinity/clickhouse-backup/releases/latest/download/clickhouse-backup-${binary_suffix}.tar.gz | \
+        tar xz -C /tmp && \
+        mv /tmp/build/linux/*/clickhouse-backup /usr/local/bin/clickhouse-backup && \
+        chmod +x /usr/local/bin/clickhouse-backup && \
+        rm -rf /tmp/build
+    " 2>&1; then
+        log_success "clickhouse-backup installed in container"
+        return 0
+    else
+        log_error "Failed to install clickhouse-backup in container"
+        log_error "You can install it manually:"
+        log_error "  docker exec ${ch_host} bash -c 'curl -sL https://github.com/Altinity/clickhouse-backup/releases/latest/download/clickhouse-backup-${binary_suffix}.tar.gz | tar xz -C /usr/local/bin'"
+        return 1
+    fi
+}
+
+# ============================================
 # Configuration Setup
 # ============================================
 
@@ -293,6 +368,19 @@ setup_configuration() {
     sudo mkdir -p /var/log
     sudo touch /var/log/octeth-backup.log
     sudo chmod 666 /var/log/octeth-backup.log
+
+    # Create ClickHouse backup directories if configured
+    local ch_backup_dir="/var/backups/octeth-ch"
+    if [ -f "${SCRIPT_DIR}/config/.env" ]; then
+        local env_ch_dir=$(grep "^CH_BACKUP_DIR=" "${SCRIPT_DIR}/config/.env" | cut -d'=' -f2)
+        if [ -n "$env_ch_dir" ]; then
+            ch_backup_dir="$env_ch_dir"
+        fi
+    fi
+
+    sudo mkdir -p "$ch_backup_dir"/{daily,weekly,monthly}
+    sudo touch /var/log/octeth-ch-backup.log
+    sudo chmod 666 /var/log/octeth-ch-backup.log
 
     log_success "Directories created"
 }
@@ -523,6 +611,18 @@ EOF
             fi
         fi
 
+        # ClickHouse backup tool (optional)
+        echo ""
+        read -p "Enable ClickHouse backups? (y/n) [n]: " enable_ch
+        if [ "$enable_ch" = "y" ] || [ "$enable_ch" = "Y" ]; then
+            if ! check_clickhouse_backup; then
+                read -p "Install clickhouse-backup inside the ClickHouse container? (y/n): " install_cb
+                if [ "$install_cb" = "y" ] || [ "$install_cb" = "Y" ]; then
+                    install_clickhouse_backup_in_container
+                fi
+            fi
+        fi
+
         log_success "All required dependencies are installed"
         echo ""
     fi
@@ -554,10 +654,11 @@ EOF
     log_success "=========================================="
     echo ""
     log_info "Next steps:"
-    echo "  1. Edit config/.env with your MySQL credentials"
-    echo "  2. Test backup: ./bin/octeth-backup.sh"
-    echo "  3. List backups: ./bin/octeth-restore.sh --list"
-    echo "  4. View cleanup policy: ./bin/octeth-cleanup.sh --stats"
+    echo "  1. Edit config/.env with your MySQL and/or ClickHouse credentials"
+    echo "  2. Test MySQL backup: ./bin/octeth-backup.sh"
+    echo "  3. Test ClickHouse backup: ./bin/octeth-ch-backup.sh"
+    echo "  4. List backups: ./bin/octeth-restore.sh --list"
+    echo "  5. View cleanup policy: ./bin/octeth-cleanup.sh --stats"
     echo ""
     log_info "Documentation: See README.md"
     echo ""

@@ -89,6 +89,23 @@ MYSQL_CMD="mysql -u${MYSQL_USERNAME} -p${MYSQL_PASSWORD} -h${MYSQL_HOST}"
 XTRABACKUP_CMD="${XTRABACKUP_BIN} --backup --target-dir=%TARGET_DIR%"
 
 # ============================================
+# ClickHouse Backup Directories and Settings
+# ============================================
+
+CH_DAILY_DIR="${CH_BACKUP_DIR}/${BACKUP_TYPE_DAILY}"
+CH_WEEKLY_DIR="${CH_BACKUP_DIR}/${BACKUP_TYPE_WEEKLY}"
+CH_MONTHLY_DIR="${CH_BACKUP_DIR}/${BACKUP_TYPE_MONTHLY}"
+
+# ClickHouse backup name prefix
+CH_BACKUP_PREFIX="octeth-ch-backup"
+
+# Cloud storage sub-prefix for ClickHouse (appended to S3_PREFIX/GCS_PREFIX/R2_PREFIX)
+CH_CLOUD_SUBDIR="clickhouse"
+
+# Docker exec command for ClickHouse container
+CH_DOCKER_EXEC="${DOCKER_CMD} exec ${CH_HOST}"
+
+# ============================================
 # Health Check Settings
 # ============================================
 
