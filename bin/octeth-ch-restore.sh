@@ -35,6 +35,55 @@ SKIP_CONFIRMATION=false
 DROP_BEFORE_RESTORE=false
 
 # ============================================
+# clickhouse-backup Execution Helper
+# ============================================
+
+detect_ch_network() {
+    if [ -n "${CH_DOCKER_NETWORK:-}" ]; then
+        echo "${CH_DOCKER_NETWORK}"
+        return 0
+    fi
+
+    local network=$(${DOCKER_CMD} inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}' ${CH_HOST} 2>/dev/null | head -n1)
+    if [ -n "$network" ]; then
+        echo "$network"
+        return 0
+    fi
+
+    log_error "Cannot detect Docker network for ${CH_HOST}. Set CH_DOCKER_NETWORK in .env"
+    return 1
+}
+
+run_clickhouse_backup() {
+    local ch_backup_mode="${CH_BACKUP_MODE:-sidecar}"
+
+    if [ "$ch_backup_mode" = "sidecar" ]; then
+        if [ -z "${CH_DATA_DIR:-}" ] || [ ! -d "${CH_DATA_DIR}" ]; then
+            log_error "CH_DATA_DIR is required for sidecar mode (current value: '${CH_DATA_DIR:-}')"
+            return 1
+        fi
+
+        local network
+        network=$(detect_ch_network) || return 1
+
+        ${DOCKER_CMD} run --rm \
+            --network "$network" \
+            -v "${CH_DATA_DIR}:/var/lib/clickhouse" \
+            -e CLICKHOUSE_HOST="${CH_HOST}" \
+            -e CLICKHOUSE_PORT="${CH_NATIVE_PORT:-9000}" \
+            -e CLICKHOUSE_USERNAME="${CH_USER}" \
+            -e CLICKHOUSE_PASSWORD="${CH_PASSWORD:-}" \
+            "${CH_BACKUP_IMAGE:-altinity/clickhouse-backup:latest}" \
+            clickhouse-backup "$@"
+    elif [ "$ch_backup_mode" = "internal" ]; then
+        ${DOCKER_CMD} exec ${CH_HOST} clickhouse-backup "$@"
+    else
+        log_error "Unknown CH_BACKUP_MODE: ${ch_backup_mode}"
+        return 1
+    fi
+}
+
+# ============================================
 # Helper Functions (macOS/POSIX compatibility)
 # ============================================
 
@@ -653,16 +702,16 @@ perform_restore() {
 
     local backup_name=$(basename "$backup_dir")
 
-    # Copy backup into ClickHouse container's backup directory
-    log_info "Copying backup to ClickHouse container..."
+    # Copy backup into ClickHouse data directory
+    log_info "Copying backup to ClickHouse backup directory..."
 
     if [ -n "${CH_DATA_DIR:-}" ] && [ -d "${CH_DATA_DIR}" ]; then
-        # Direct copy via mounted volume
+        # Direct copy via mounted volume (works for both sidecar and internal modes)
         mkdir -p "${CH_DATA_DIR}/backup/"
         cp -a "${backup_dir}" "${CH_DATA_DIR}/backup/${backup_name}"
         log_success "Backup copied via mounted volume"
     else
-        # Use docker cp
+        # Fallback: Use docker cp into the ClickHouse container (internal mode only)
         ${DOCKER_CMD} exec ${CH_HOST} mkdir -p /var/lib/clickhouse/backup/
         ${DOCKER_CMD} cp "${backup_dir}" "${CH_HOST}:/var/lib/clickhouse/backup/${backup_name}"
         log_success "Backup copied via docker cp"
@@ -695,15 +744,14 @@ perform_restore() {
         restore_opts="--schema --data"
     fi
 
-    if ${DOCKER_CMD} exec ${CH_HOST} clickhouse-backup restore \
+    if run_clickhouse_backup restore \
         --tables="${CH_DATABASE}.*" \
         ${restore_opts} \
         "${backup_name}" 2>&1; then
         log_success "clickhouse-backup restore completed"
     else
         log_error "clickhouse-backup restore failed"
-        # Clean up backup from container
-        ${DOCKER_CMD} exec ${CH_HOST} clickhouse-backup delete local "${backup_name}" 2>/dev/null || true
+        run_clickhouse_backup delete local "${backup_name}" 2>/dev/null || true
         exit 1
     fi
 
@@ -721,7 +769,7 @@ perform_restore() {
 
     # Cleanup
     log_info "Cleaning up..."
-    ${DOCKER_CMD} exec ${CH_HOST} clickhouse-backup delete local "${backup_name}" 2>/dev/null || true
+    run_clickhouse_backup delete local "${backup_name}" 2>/dev/null || true
     rm -rf "$extract_dir"
 }
 

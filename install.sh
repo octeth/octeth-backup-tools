@@ -712,13 +712,69 @@ install_dependencies() {
     if [ "$ENABLE_CLICKHOUSE" = true ]; then
         echo ""
         log_info "--- ClickHouse Dependencies ---"
-        if ! check_clickhouse_backup; then
-            read -p "Install clickhouse-backup inside the ClickHouse container? (y/n): " install_cb
-            if [ "$install_cb" = "y" ] || [ "$install_cb" = "Y" ]; then
-                install_clickhouse_backup_in_container || log_warn "clickhouse-backup installation failed (you can install it later)"
+        echo ""
+        echo "How do you want to run clickhouse-backup?"
+        echo ""
+        echo "  1) Sidecar container (recommended)"
+        echo "     Uses the official altinity/clickhouse-backup Docker image."
+        echo "     Keeps the ClickHouse container clean and untouched."
+        echo "     Requires CH_DATA_DIR to be set (ClickHouse data volume path on host)."
+        echo ""
+        echo "  2) Internal (inside the ClickHouse container)"
+        echo "     Installs clickhouse-backup binary inside the ClickHouse container."
+        echo "     Simpler but modifies the container (lost on rebuild)."
+        echo ""
+        read -p "Select [1-2] (default: 1): " ch_mode_choice
+        ch_mode_choice=${ch_mode_choice:-1}
+
+        if [ "$ch_mode_choice" = "2" ]; then
+            # Internal mode
+            log_info "Selected: internal mode"
+            if [ -f "${SCRIPT_DIR}/config/.env" ]; then
+                sed -i "s/^CH_BACKUP_MODE=.*/CH_BACKUP_MODE=internal/" "${SCRIPT_DIR}/config/.env" 2>/dev/null || true
+            fi
+
+            if ! check_clickhouse_backup; then
+                read -p "Install clickhouse-backup inside the ClickHouse container? (y/n): " install_cb
+                if [ "$install_cb" = "y" ] || [ "$install_cb" = "Y" ]; then
+                    install_clickhouse_backup_in_container || log_warn "clickhouse-backup installation failed (you can install it later)"
+                else
+                    log_warn "clickhouse-backup is required for ClickHouse backups"
+                    log_warn "You can install it later with: sudo ./install.sh --deps-only --clickhouse"
+                fi
+            fi
+        else
+            # Sidecar mode (default)
+            log_info "Selected: sidecar mode"
+            if [ -f "${SCRIPT_DIR}/config/.env" ]; then
+                sed -i "s/^CH_BACKUP_MODE=.*/CH_BACKUP_MODE=sidecar/" "${SCRIPT_DIR}/config/.env" 2>/dev/null || true
+            fi
+
+            # Auto-detect CH_DATA_DIR from container mounts
+            local detected_data_dir=$(docker inspect ${CH_HOST:-oempro_clickhouse} --format '{{range .Mounts}}{{if eq .Destination "/var/lib/clickhouse"}}{{.Source}}{{end}}{{end}}' 2>/dev/null || echo "")
+
+            if [ -n "$detected_data_dir" ]; then
+                log_success "Auto-detected ClickHouse data directory: ${detected_data_dir}"
+                read -p "Use this path for CH_DATA_DIR? (y/n) [y]: " use_detected
+                use_detected=${use_detected:-y}
+                if [ "$use_detected" = "y" ] || [ "$use_detected" = "Y" ]; then
+                    if [ -f "${SCRIPT_DIR}/config/.env" ]; then
+                        sed -i "s|^CH_DATA_DIR=.*|CH_DATA_DIR=${detected_data_dir}|" "${SCRIPT_DIR}/config/.env" 2>/dev/null || true
+                    fi
+                fi
             else
-                log_warn "clickhouse-backup is required for ClickHouse backups"
-                log_warn "You can install it later with: sudo ./install.sh --deps-only --clickhouse"
+                log_warn "Could not auto-detect ClickHouse data directory"
+                log_warn "Please set CH_DATA_DIR in config/.env manually"
+                log_warn "Find it with: docker inspect ${CH_HOST:-oempro_clickhouse} --format '{{range .Mounts}}{{if eq .Destination \"/var/lib/clickhouse\"}}{{.Source}}{{end}}{{end}}'"
+            fi
+
+            # Pull the sidecar image
+            local ch_image="${CH_BACKUP_IMAGE:-altinity/clickhouse-backup:latest}"
+            log_info "Pulling clickhouse-backup image: ${ch_image}"
+            if docker pull "${ch_image}"; then
+                log_success "Image pulled: ${ch_image}"
+            else
+                log_warn "Failed to pull ${ch_image} (you can pull it later)"
             fi
         fi
     fi

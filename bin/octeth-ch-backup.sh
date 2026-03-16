@@ -109,17 +109,102 @@ check_lock_file() {
     log_info "Lock file created: ${CH_LOCK_FILE}"
 }
 
-check_clickhouse_backup() {
-    # clickhouse-backup runs inside the ClickHouse container
-    if ! ${DOCKER_CMD} exec ${CH_HOST} clickhouse-backup --version &> /dev/null; then
-        log_error "clickhouse-backup not found inside container ${CH_HOST}"
-        log_error "Install it: https://github.com/Altinity/clickhouse-backup#installation"
-        log_error "Or run: docker exec ${CH_HOST} bash -c 'curl -sL https://github.com/Altinity/clickhouse-backup/releases/latest/download/clickhouse-backup-linux-amd64.tar.gz | tar xz -C /usr/local/bin'"
-        exit 1
+# ============================================
+# clickhouse-backup Execution Helper
+# ============================================
+
+# Detect Docker network of the ClickHouse container
+detect_ch_network() {
+    if [ -n "${CH_DOCKER_NETWORK:-}" ]; then
+        echo "${CH_DOCKER_NETWORK}"
+        return 0
     fi
 
-    local cb_version=$(${DOCKER_CMD} exec ${CH_HOST} clickhouse-backup --version 2>&1 | head -n1)
-    log_info "Using clickhouse-backup: ${cb_version}"
+    local network=$(${DOCKER_CMD} inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}' ${CH_HOST} 2>/dev/null | head -n1)
+    if [ -n "$network" ]; then
+        echo "$network"
+        return 0
+    fi
+
+    log_error "Cannot detect Docker network for ${CH_HOST}. Set CH_DOCKER_NETWORK in .env"
+    return 1
+}
+
+# Run a clickhouse-backup command using either sidecar or internal mode
+run_clickhouse_backup() {
+    local ch_backup_mode="${CH_BACKUP_MODE:-sidecar}"
+
+    if [ "$ch_backup_mode" = "sidecar" ]; then
+        # Validate CH_DATA_DIR is set for sidecar mode
+        if [ -z "${CH_DATA_DIR:-}" ] || [ ! -d "${CH_DATA_DIR}" ]; then
+            log_error "CH_DATA_DIR is required for sidecar mode (current value: '${CH_DATA_DIR:-}')"
+            log_error "Set CH_DATA_DIR to the host path mounted as /var/lib/clickhouse in the ClickHouse container"
+            return 1
+        fi
+
+        local network
+        network=$(detect_ch_network) || return 1
+
+        ${DOCKER_CMD} run --rm \
+            --network "$network" \
+            -v "${CH_DATA_DIR}:/var/lib/clickhouse" \
+            -e CLICKHOUSE_HOST="${CH_HOST}" \
+            -e CLICKHOUSE_PORT="${CH_NATIVE_PORT:-9000}" \
+            -e CLICKHOUSE_USERNAME="${CH_USER}" \
+            -e CLICKHOUSE_PASSWORD="${CH_PASSWORD:-}" \
+            "${CH_BACKUP_IMAGE:-altinity/clickhouse-backup:latest}" \
+            clickhouse-backup "$@"
+    elif [ "$ch_backup_mode" = "internal" ]; then
+        ${DOCKER_CMD} exec ${CH_HOST} clickhouse-backup "$@"
+    else
+        log_error "Unknown CH_BACKUP_MODE: ${ch_backup_mode} (expected 'sidecar' or 'internal')"
+        return 1
+    fi
+}
+
+check_clickhouse_backup() {
+    local ch_backup_mode="${CH_BACKUP_MODE:-sidecar}"
+
+    if [ "$ch_backup_mode" = "sidecar" ]; then
+        log_info "Backup mode: sidecar (using ${CH_BACKUP_IMAGE:-altinity/clickhouse-backup:latest})"
+
+        # Validate CH_DATA_DIR
+        if [ -z "${CH_DATA_DIR:-}" ] || [ ! -d "${CH_DATA_DIR}" ]; then
+            log_error "CH_DATA_DIR is required for sidecar mode"
+            log_error "Set CH_DATA_DIR to the host path mounted as /var/lib/clickhouse"
+            log_error "Find it with: docker inspect ${CH_HOST} --format '{{range .Mounts}}{{if eq .Destination \"/var/lib/clickhouse\"}}{{.Source}}{{end}}{{end}}'"
+            exit 1
+        fi
+
+        # Pull image if needed (check if it exists locally)
+        if ! ${DOCKER_CMD} image inspect "${CH_BACKUP_IMAGE:-altinity/clickhouse-backup:latest}" &> /dev/null; then
+            log_info "Pulling clickhouse-backup image..."
+            if ! ${DOCKER_CMD} pull "${CH_BACKUP_IMAGE:-altinity/clickhouse-backup:latest}" >> "${CH_LOG_FILE}" 2>&1; then
+                log_error "Failed to pull ${CH_BACKUP_IMAGE:-altinity/clickhouse-backup:latest}"
+                exit 1
+            fi
+        fi
+
+        local cb_version
+        cb_version=$(run_clickhouse_backup --version 2>&1 | head -n1) || true
+        log_info "Using clickhouse-backup (sidecar): ${cb_version}"
+
+    elif [ "$ch_backup_mode" = "internal" ]; then
+        log_info "Backup mode: internal (inside ${CH_HOST} container)"
+
+        if ! ${DOCKER_CMD} exec ${CH_HOST} clickhouse-backup --version &> /dev/null; then
+            log_error "clickhouse-backup not found inside container ${CH_HOST}"
+            log_error "Either install it in the container or switch to sidecar mode:"
+            log_error "  Set CH_BACKUP_MODE=sidecar in config/.env (recommended)"
+            exit 1
+        fi
+
+        local cb_version=$(${DOCKER_CMD} exec ${CH_HOST} clickhouse-backup --version 2>&1 | head -n1)
+        log_info "Using clickhouse-backup (internal): ${cb_version}"
+    else
+        log_error "Unknown CH_BACKUP_MODE: ${ch_backup_mode}"
+        exit 1
+    fi
 }
 
 check_compression_tool() {
@@ -235,10 +320,10 @@ perform_backup() {
     # Create temporary directory
     mkdir -p "${CH_TEMP_DIR}"
 
-    # Run clickhouse-backup create inside the container
+    # Run clickhouse-backup create
     log_info "Running: clickhouse-backup create ${BACKUP_NAME}"
 
-    if ${DOCKER_CMD} exec ${CH_HOST} clickhouse-backup create \
+    if run_clickhouse_backup create \
         --tables="${CH_DATABASE}.*" \
         "${BACKUP_NAME}" >> "${CH_LOG_FILE}" 2>&1; then
         log_success "clickhouse-backup create completed successfully"
@@ -248,30 +333,30 @@ perform_backup() {
         return 1
     fi
 
-    # Copy backup from container to host
+    # Copy backup to temp directory
     local temp_backup_dir="${CH_TEMP_DIR}/${BACKUP_NAME}"
 
     if [ -n "${CH_DATA_DIR:-}" ] && [ -d "${CH_DATA_DIR}/backup/${BACKUP_NAME}" ]; then
-        # Direct access via mounted volume
-        log_info "Copying backup from mounted volume: ${CH_DATA_DIR}/backup/${BACKUP_NAME}"
+        # Direct access via mounted volume (works for both sidecar and internal modes)
+        log_info "Copying backup from data directory: ${CH_DATA_DIR}/backup/${BACKUP_NAME}"
         cp -a "${CH_DATA_DIR}/backup/${BACKUP_NAME}" "${temp_backup_dir}"
     else
-        # Use docker cp
+        # Fallback: Use docker cp from the ClickHouse container (internal mode only)
         log_info "Copying backup from container via docker cp"
         ${DOCKER_CMD} cp "${CH_HOST}:/var/lib/clickhouse/backup/${BACKUP_NAME}" "${temp_backup_dir}"
     fi
 
     if [ ! -d "${temp_backup_dir}" ]; then
-        log_error "Failed to copy backup from container"
+        log_error "Failed to copy backup to temp directory"
         EXIT_CODE=1
         return 1
     fi
 
     log_success "Backup copied to host: ${temp_backup_dir}"
 
-    # Clean up backup inside the container
-    ${DOCKER_CMD} exec ${CH_HOST} clickhouse-backup delete local "${BACKUP_NAME}" >> "${CH_LOG_FILE}" 2>&1 || \
-        log_warn "Failed to clean up backup inside container (non-fatal)"
+    # Clean up raw backup from the data directory
+    run_clickhouse_backup delete local "${BACKUP_NAME}" >> "${CH_LOG_FILE}" 2>&1 || \
+        log_warn "Failed to clean up raw backup (non-fatal)"
 
     echo "${temp_backup_dir}"
 }
