@@ -84,13 +84,14 @@ run_clickhouse_backup() {
 
         ${DOCKER_CMD} run --rm \
             --network "$network" \
+            --entrypoint clickhouse-backup \
             -v "${CH_DATA_DIR}:/var/lib/clickhouse" \
             -e CLICKHOUSE_HOST="${ch_connect_host}" \
             -e CLICKHOUSE_PORT="${CH_NATIVE_PORT:-9000}" \
             -e CLICKHOUSE_USERNAME="${CH_USER}" \
             -e CLICKHOUSE_PASSWORD="${CH_PASSWORD:-}" \
             "${CH_BACKUP_IMAGE:-altinity/clickhouse-backup:latest}" \
-            clickhouse-backup "$@"
+            "$@"
     elif [ "$ch_backup_mode" = "internal" ]; then
         ${DOCKER_CMD} exec ${CH_HOST} clickhouse-backup "$@"
     else
