@@ -1097,6 +1097,9 @@ echo "docker-compose.override.yml" >> .gitignore
 
 #### Step 2: Restore Backup into Docker Volume
 
+> [!IMPORTANT]
+> If the backup file is on CloudFlare R2, follow [these instructions](https://github.com/octeth/oempro/wiki/Setting-Up-Customer-Local-Dev-Environment-Database-From-Production#download-production-backup-from-cloudflare-r2) to download it.
+
 ```bash
 # Download backup from production server to ~/tmp/
 scp user@production:/var/backups/octeth/daily/octeth-backup-YYYY-MM-DD.tar.gz ~/tmp/
