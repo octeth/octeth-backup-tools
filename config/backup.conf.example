@@ -142,5 +142,7 @@ MONTHLY_DAY=1
 EMAIL_SUBJECT_SUCCESS="[SUCCESS] Octeth Backup Completed"
 EMAIL_SUBJECT_FAILURE="[FAILURE] Octeth Backup Failed"
 
-WEBHOOK_PAYLOAD_SUCCESS='{"status":"success","message":"Octeth backup completed","timestamp":"%TIMESTAMP%","backup_size":"%SIZE%"}'
-WEBHOOK_PAYLOAD_FAILURE='{"status":"failure","message":"Octeth backup failed","timestamp":"%TIMESTAMP%","error":"%ERROR%"}'
+# The "text" field makes these payloads accepted by Slack incoming webhooks
+# (which reject payloads without it); other webhook consumers ignore extra fields.
+WEBHOOK_PAYLOAD_SUCCESS='{"text":"✅ Octeth backup completed (%SIZE%) at %TIMESTAMP%","status":"success","backup_size":"%SIZE%","timestamp":"%TIMESTAMP%"}'
+WEBHOOK_PAYLOAD_FAILURE='{"text":"🚨 Octeth backup FAILED at %TIMESTAMP%: %ERROR%","status":"failure","error":"%ERROR%","timestamp":"%TIMESTAMP%"}'
