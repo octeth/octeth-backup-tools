@@ -1,4 +1,4 @@
-# CLAUDE.md - Octeth MySQL Backup Tool
+# CLAUDE.md - Octeth MySQL + ClickHouse Backup Tool
 
 This file provides comprehensive guidance for AI assistants (Claude, GitHub Copilot, etc.) working with the Octeth Backup Tools codebase.
 
@@ -9,7 +9,9 @@ This file provides comprehensive guidance for AI assistants (Claude, GitHub Copi
 ### Key Features
 - **Zero-Downtime Hot Backups**: Uses Percona XtraBackup for hot backups while MySQL stays online
 - **Smart Retention Policy**: Daily (7 days) + Weekly (4 weeks) + Monthly (6 months)
-- **Dual Storage**: Local filesystem + S3-compatible cloud storage
+- **Streaming Compression**: MySQL backups stream `xbstream` straight into the compressor → `*.xbstream.gz` (no uncompressed staging); ClickHouse tars its backup dir straight into the compressor
+- **Multi-Cloud Storage**: one provider at a time — S3, GCS, R2, or `none`
+- **No-Local Mode**: `KEEP_LOCAL_BACKUP=false` deletes the local copy after a successful cloud upload
 - **Production-Ready**: Comprehensive error handling, logging, and notifications
 - **Fast & Efficient**: 70-80% less CPU usage compared to mysqldump
 - **Parallel Compression**: Supports pigz for faster compression
@@ -52,22 +54,21 @@ octeth-backup-tools/
 **Purpose**: Performs hot backups of MySQL databases using XtraBackup.
 
 **Key Functions**:
-- `check_lock_file()`: Prevents concurrent backup runs (lines 95-110)
-- `check_xtrabackup()`: Verifies XtraBackup installation (lines 112-121)
-- `check_disk_space()`: Validates sufficient disk space, critical for avoiding "No space left on device" errors (lines 123-167)
-- `check_mysql_connection()`: Tests MySQL connectivity (lines 169-178)
-- `determine_backup_type()`: Determines daily/weekly/monthly based on date (lines 201-221)
-- `perform_backup()`: Executes XtraBackup hot backup (lines 227-307)
-- `compress_backup()`: Compresses backup with pigz/gzip (lines 309-338)
-- `upload_to_s3()`: Uploads to S3 storage (lines 344-373)
-- `send_notifications()`: Sends email/webhook notifications (lines 421-488)
+- `check_lock_file()`: Prevents concurrent backup runs
+- `check_xtrabackup()`: Verifies XtraBackup installation
+- `check_disk_space()`: Validates free space in `BACKUP_DIR` against a ~40%-of-DB compressed estimate
+- `check_mysql_connection()`: Tests MySQL connectivity
+- `determine_backup_type()`: Determines daily/weekly/monthly based on date
+- `perform_backup()`: Streams `xtrabackup --stream=xbstream | compressor` → `*.xbstream.gz`, integrity-checks it, writes the `.sha256` (no separate compress function anymore)
+- `upload_to_cloud()` → `upload_to_{s3,gcs,r2}()`: provider dispatch; data upload must succeed (`|| return 1`) before the caller may delete the local copy
+- `send_notifications()`: Sends email/webhook notifications
 
 **Critical Implementation Details**:
-- Uses XtraBackup from the HOST, not inside the container (line 277)
+- Uses XtraBackup from the HOST, not inside the container
 - Requires access to MySQL data directory on host filesystem (MYSQL_DATA_DIR)
-- Calculates required temp space: DB size + 20% + 5GB buffer (lines 150-164)
-- Creates checksums (SHA256) for all backups (lines 328-330)
-- Supports both direct port access and container IP connection (lines 243-261)
+- Streams compressed output directly to `BACKUP_DIR` — no uncompressed temp staging
+- Creates checksums (SHA256) for all backups
+- Connection detection order: exposed port → host-network mode → container IP
 
 **Error Handling**:
 - Comprehensive disk space checks before backup starts
@@ -244,7 +245,9 @@ MYSQL_DATA_DIR=                      # HOST path to MySQL data (CRITICAL)
 
 # Storage
 BACKUP_DIR=/var/backups/octeth       # Local backup location
-TEMP_DIR=/var/backups/octeth/tmp     # Must have DB size + 20% + 5GB free
+TEMP_DIR=/var/backups/octeth/tmp     # Used by RESTORE (extract+prepare); backups no longer stage here
+KEEP_LOCAL_BACKUP=true               # false = delete local copy after successful upload (MySQL + CH)
+MYSQL_LOG_BIN=                       # set if binlogs live outside the datadir (auto --log-bin-index)
 
 # Compression
 COMPRESSION_TOOL=auto                # auto, pigz, or gzip
@@ -283,7 +286,7 @@ WEBHOOK_ENABLED=false
 
 # Advanced
 DOCKER_CMD=docker                    # Use "sudo docker" if needed
-VERIFY_BACKUP=true                   # Runs XtraBackup --prepare
+VERIFY_BACKUP=true                   # Integrity-checks the compressed archive (prepare runs at restore)
 ```
 
 ### Backup Configuration (`backup.conf`)
@@ -393,48 +396,31 @@ Percona XtraBackup:
 - Multi-threaded
 - Hot backup with transaction log consistency
 
-### Backup Process
+### Backup Process (streaming, single pass)
 
-1. **Backup Phase** (lines 277-291 in octeth-backup.sh):
-   ```bash
-   xtrabackup --backup \
-     --target-dir="${temp_backup_dir}" \
-     --datadir="${MYSQL_DATA_DIR}" \
-     --host="${mysql_host}" \
-     --port="${mysql_port}" \
-     --user=root \
-     --password="${MYSQL_ROOT_PASSWORD}" \
-     --parallel=${threads}
-   ```
-   - Copies InnoDB data files
-   - Records transaction log position
-   - No table locks (hot backup)
+`perform_backup()` streams the backup straight into the compressor and writes a single `*.xbstream.gz` — there is **no** uncompressed temp staging dir, **no** separate tar pass, and **no** inline `--prepare`:
 
-2. **Prepare Phase** (lines 294-304):
-   ```bash
-   xtrabackup --prepare --target-dir="${temp_backup_dir}"
-   ```
-   - Applies transaction logs
-   - Makes backup consistent
-   - Required for restore
+```bash
+xtrabackup --backup --datadir="${MYSQL_DATA_DIR}" \
+  --host="${mysql_host}" --port="${mysql_port}" --user=root --password="..." \
+  --parallel=${threads} ${log_bin_opt} ${log_bin_index_opt} --stream=xbstream \
+  ${XTRABACKUP_EXTRA_OPTS} 2>> "${LOG_FILE}" \
+  | ${COMPRESSION_TOOL} -${COMPRESSION_LEVEL} > "${dest_file}"
+```
 
-3. **Compression** (lines 320):
-   ```bash
-   tar -cf - -C "${parent_dir}" "${backup_dirname}" | ${COMPRESSION_TOOL} -${COMPRESSION_LEVEL} > "${dest_file}"
-   ```
-   - Parallel compression with pigz (3-4x faster)
-   - Adjustable compression level (1-9)
+Key points:
+- The artifact is `*.xbstream.gz`, NOT a prepared `*.tar.gz` directory. The script relies on `set -o pipefail` to fail if either xtrabackup or the compressor fails.
+- A streamed backup **cannot be `--prepare`d in place**, so prepare moved to **restore** time. `VERIFY_BACKUP=true` now runs `${COMPRESSION_TOOL} -t` (integrity check), not a prepare.
+- `MYSQL_LOG_BIN` (when set) auto-passes `--log-bin` + derived `--log-bin-index` for binlogs outside the datadir. Empty → both omitted.
+- The connection logic detects exposed port → host-network mode → container IP (in that order). Preserve it when editing.
+
+### No-local-retention invariant
+
+When `KEEP_LOCAL_BACKUP=false`, `main()` deletes the local file after upload. This is only safe because `upload_to_{s3,gcs,r2}` **return non-zero if the data-file upload fails** (`... "$backup_file" ... || return 1`; checksum upload is best-effort). `main()` deletes local only when the upload returned success and the provider isn't `none`. If you edit the upload functions, preserve this or a failed upload could delete the only copy. The same pattern applies in `octeth-ch-backup.sh`.
 
 ### Restore Process
 
-1. **Extract** (line 352 in octeth-restore.sh)
-2. **Stop MySQL** (line 369)
-3. **Safety Backup** (line 400)
-4. **Clear Data Directory** (line 406)
-5. **Copy Restored Data** (line 411)
-6. **Fix Permissions** (line 421)
-7. **Start MySQL** (line 425)
-8. **Verify** (lines 452-454)
+Restore branches on extension: `*.xbstream.gz` → decompress → `xbstream -x` → `xtrabackup --prepare`; legacy `*.tar.gz` → `tar -xzf` (already prepared). Then both converge: stop MySQL → safety-copy the data dir → wipe + replace → `chown 999:999` → start → poll `mysqladmin ping`. Restore extracts the full uncompressed DB into `TEMP_DIR`, so that's where the large disk requirement now lives.
 
 ## Integration with Octeth
 
@@ -597,12 +583,11 @@ Cost optimization:
 
 ### "No space left on device"
 
-**Cause**: TEMP_DIR too small for uncompressed database.
+**Cause**: Backups now stream-compress directly to `BACKUP_DIR` (only the compressed `.xbstream.gz`, ~40% of the DB), so this points at `BACKUP_DIR` running low — not `TEMP_DIR`. (Restore, however, still extracts the full uncompressed DB into `TEMP_DIR`.)
 
 **Solution**:
-1. Set `TEMP_DIR=/var/backups/octeth/tmp` in .env
-2. Ensure disk has DB size + 20% + 5GB free
-3. Clean up old backups: `./bin/octeth-cleanup.sh`
+1. Free space on `BACKUP_DIR`'s disk; lower `RETENTION_*` or set `KEEP_LOCAL_BACKUP=false`
+2. Run `./bin/octeth-cleanup.sh`
 
 ### "XtraBackup not found"
 
