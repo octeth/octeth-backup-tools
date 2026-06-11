@@ -247,15 +247,14 @@ check_compression_tool() {
 }
 
 check_disk_space() {
-    local backup_dir_parent=$(dirname "${CH_BACKUP_DIR}")
-
-    # Create backup and temp directories if they don't exist
+    # The compressed backup is written to CH_BACKUP_DIR. clickhouse-backup's local
+    # "create" uses hardlinks to the data parts (near-zero extra space), and we tar
+    # straight into the compressor, so we no longer stage a second uncompressed
+    # copy. Validate the backup destination.
     mkdir -p "${CH_BACKUP_DIR}"
-    mkdir -p "${CH_TEMP_DIR}"
 
-    # Check disk usage for backup directory
-    local disk_usage=$(df -h "${backup_dir_parent}" | awk 'NR==2 {print $5}' | sed 's/%//')
-    local free_space_gb=$(df -BG "${backup_dir_parent}" | awk 'NR==2 {print $4}' | sed 's/G//')
+    local disk_usage=$(df -h "${CH_BACKUP_DIR}" | awk 'NR==2 {print $5}' | sed 's/%//')
+    local free_space_gb=$(df -BG "${CH_BACKUP_DIR}" | awk 'NR==2 {print $4}' | sed 's/G//')
 
     if [ "$disk_usage" -gt "$MAX_DISK_USAGE" ]; then
         log_error "Backup directory disk usage is ${disk_usage}% (threshold: ${MAX_DISK_USAGE}%)"
@@ -267,30 +266,23 @@ check_disk_space() {
         exit 1
     fi
 
-    log_info "Backup directory disk check passed: ${free_space_gb}GB free, ${disk_usage}% used"
-
-    # Check temp directory space
-    local temp_disk_usage=$(df -h "${CH_TEMP_DIR}" | awk 'NR==2 {print $5}' | sed 's/%//')
-    local temp_free_space_gb=$(df -BG "${CH_TEMP_DIR}" | awk 'NR==2 {print $4}' | sed 's/G//')
-
-    # Estimate required space from ClickHouse database size
+    # Rough sanity check: estimate compressed size ~40% of the ClickHouse db size.
     local db_size_bytes=$(${DOCKER_CMD} exec ${CH_HOST} clickhouse-client \
         --user="${CH_USER}" ${CH_PASSWORD:+--password="${CH_PASSWORD}"} \
         --query="SELECT coalesce(sum(bytes_on_disk), 0) FROM system.parts WHERE active AND database='${CH_DATABASE}'" 2>/dev/null || echo "0")
 
     local db_size_gb=$((db_size_bytes / 1024 / 1024 / 1024))
-    local required_space=$((db_size_gb + db_size_gb / 5 + 5))  # DB size + 20% + 5GB buffer
+    local est_compressed=$((db_size_gb * 2 / 5 + 1))  # ~40% of DB + 1GB buffer
 
-    log_info "Database size: ~${db_size_gb}GB, temp directory has ${temp_free_space_gb}GB free"
+    log_info "Database size: ~${db_size_gb}GB, estimated compressed backup: ~${est_compressed}GB, ${free_space_gb}GB free"
 
-    if [ "$temp_free_space_gb" -lt "$required_space" ]; then
-        log_error "Insufficient space in temp directory!"
-        log_error "Required: ~${required_space}GB, Available: ${temp_free_space_gb}GB"
-        log_error "Please increase CH_TEMP_DIR space or set CH_TEMP_DIR to a location with more space"
+    if [ "$free_space_gb" -lt "$est_compressed" ]; then
+        log_error "Insufficient space for compressed backup in ${CH_BACKUP_DIR}"
+        log_error "Estimated required: ~${est_compressed}GB, Available: ${free_space_gb}GB"
         exit 1
     fi
 
-    log_info "Temp directory disk check passed: ${temp_free_space_gb}GB free, ${temp_disk_usage}% used"
+    log_info "Backup directory disk check passed: ${free_space_gb}GB free, ${disk_usage}% used"
 }
 
 check_clickhouse_connection() {
@@ -339,8 +331,7 @@ determine_backup_type() {
 perform_backup() {
     log_info "Starting ClickHouse hot backup (zero downtime)"
 
-    # Create temporary directory
-    mkdir -p "${CH_TEMP_DIR}"
+    local dest_file="${BACKUP_DEST}/${BACKUP_NAME}.tar.gz"
 
     # Run clickhouse-backup create
     log_info "Running: clickhouse-backup create ${BACKUP_NAME}"
@@ -355,63 +346,48 @@ perform_backup() {
         return 1
     fi
 
-    # Copy backup to temp directory
-    local temp_backup_dir="${CH_TEMP_DIR}/${BACKUP_NAME}"
+    # Compress the freshly created backup directly into the destination, streaming
+    # tar -> compressor. This avoids staging a second full copy in CH_TEMP_DIR.
+    # pipefail makes the pipeline fail if either tar or the compressor fails.
+    log_info "Compressing backup with ${COMPRESSION_TOOL}"
 
     if [ -n "${CH_DATA_DIR:-}" ] && [ -d "${CH_DATA_DIR}/backup/${BACKUP_NAME}" ]; then
-        # Direct access via mounted volume (works for both sidecar and internal modes)
-        log_info "Copying backup from data directory: ${CH_DATA_DIR}/backup/${BACKUP_NAME}"
-        cp -a "${CH_DATA_DIR}/backup/${BACKUP_NAME}" "${temp_backup_dir}"
+        # Backup directory is reachable on the host via the mounted volume
+        log_info "Archiving from data directory: ${CH_DATA_DIR}/backup/${BACKUP_NAME}"
+        if ! tar -cf - -C "${CH_DATA_DIR}/backup" "${BACKUP_NAME}" \
+            | ${COMPRESSION_TOOL} -${COMPRESSION_LEVEL} > "${dest_file}"; then
+            log_error "Compression failed"
+            rm -f "${dest_file}"
+            EXIT_CODE=1
+            return 1
+        fi
     else
-        # Fallback: Use docker cp from the ClickHouse container (internal mode only)
-        log_info "Copying backup from container via docker cp"
-        ${DOCKER_CMD} cp "${CH_HOST}:/var/lib/clickhouse/backup/${BACKUP_NAME}" "${temp_backup_dir}"
+        # Internal mode without host volume access: stream tar out of the container
+        log_info "Archiving from container via docker exec tar"
+        if ! ${DOCKER_CMD} exec ${CH_HOST} tar -cf - -C /var/lib/clickhouse/backup "${BACKUP_NAME}" \
+            | ${COMPRESSION_TOOL} -${COMPRESSION_LEVEL} > "${dest_file}"; then
+            log_error "Compression failed"
+            rm -f "${dest_file}"
+            EXIT_CODE=1
+            return 1
+        fi
     fi
 
-    if [ ! -d "${temp_backup_dir}" ]; then
-        log_error "Failed to copy backup to temp directory"
-        EXIT_CODE=1
-        return 1
-    fi
+    log_success "Backup compressed: ${dest_file}"
 
-    log_success "Backup copied to host: ${temp_backup_dir}"
+    # Size + checksum
+    local size=$(du -h "${dest_file}" | cut -f1)
+    log_info "Backup size: ${size}"
 
-    # Clean up raw backup from the data directory
+    local checksum=$(sha256sum "${dest_file}" | cut -d' ' -f1)
+    echo "${checksum}  ${BACKUP_NAME}.tar.gz" > "${dest_file}.sha256"
+    log_info "Checksum: ${checksum}"
+
+    # Clean up the raw backup from clickhouse-backup local storage
     run_clickhouse_backup delete local "${BACKUP_NAME}" >> "${CH_LOG_FILE}" 2>&1 || \
         log_warn "Failed to clean up raw backup (non-fatal)"
 
-    echo "${temp_backup_dir}"
-}
-
-compress_backup() {
-    local source_dir="$1"
-    local dest_file="${BACKUP_DEST}/${BACKUP_NAME}.tar.gz"
-
-    log_info "Compressing backup with ${COMPRESSION_TOOL}"
-
-    # Get parent directory and backup directory name
-    local parent_dir=$(dirname "${source_dir}")
-    local backup_dirname=$(basename "${source_dir}")
-
-    # Compress backup using tar and pigz/gzip
-    if tar -cf - -C "${parent_dir}" "${backup_dirname}" | ${COMPRESSION_TOOL} -${COMPRESSION_LEVEL} > "${dest_file}"; then
-        log_success "Backup compressed: ${dest_file}"
-
-        # Calculate size
-        local size=$(du -h "${dest_file}" | cut -f1)
-        log_info "Backup size: ${size}"
-
-        # Create checksum
-        local checksum=$(sha256sum "${dest_file}" | cut -d' ' -f1)
-        echo "${checksum}  ${BACKUP_NAME}.tar.gz" > "${dest_file}.sha256"
-        log_info "Checksum: ${checksum}"
-
-        echo "${dest_file}"
-    else
-        log_error "Compression failed"
-        EXIT_CODE=1
-        return 1
-    fi
+    echo "${dest_file}"
 }
 
 # ============================================
@@ -447,23 +423,27 @@ upload_to_s3() {
 
     log_info "Uploading to S3: s3://${S3_BUCKET}/${S3_PREFIX}/${s3_path}"
 
+    # The data upload MUST succeed; if it fails, return failure now so the caller
+    # never deletes the local copy (KEEP_LOCAL_BACKUP). Checksum upload is best-effort.
     if [ "${S3_UPLOAD_TOOL}" = "awscli" ]; then
-        upload_s3_with_aws_cli "$backup_file" "$s3_path"
+        upload_s3_with_aws_cli "$backup_file" "$s3_path" || return 1
     elif [ "${S3_UPLOAD_TOOL}" = "rclone" ]; then
-        upload_s3_with_rclone "$backup_file" "$s3_path"
+        upload_s3_with_rclone "$backup_file" "$s3_path" || return 1
     else
         log_error "Unknown S3 upload tool: ${S3_UPLOAD_TOOL}"
         return 1
     fi
 
-    # Upload checksum file
+    # Upload checksum file (best-effort)
     if [ -f "$checksum_file" ]; then
         if [ "${S3_UPLOAD_TOOL}" = "awscli" ]; then
-            upload_s3_with_aws_cli "$checksum_file" "${s3_path}.sha256"
+            upload_s3_with_aws_cli "$checksum_file" "${s3_path}.sha256" || log_warn "Checksum upload failed"
         else
-            upload_s3_with_rclone "$checksum_file" "${s3_path}.sha256"
+            upload_s3_with_rclone "$checksum_file" "${s3_path}.sha256" || log_warn "Checksum upload failed"
         fi
     fi
+
+    return 0
 }
 
 upload_s3_with_aws_cli() {
@@ -519,23 +499,27 @@ upload_to_gcs() {
 
     log_info "Uploading to GCS: gs://${GCS_BUCKET}/${GCS_PREFIX}/${gcs_path}"
 
+    # The data upload MUST succeed; if it fails, return failure now so the caller
+    # never deletes the local copy (KEEP_LOCAL_BACKUP). Checksum upload is best-effort.
     if [ "${GCS_UPLOAD_TOOL}" = "gsutil" ]; then
-        upload_gcs_with_gsutil "$backup_file" "$gcs_path"
+        upload_gcs_with_gsutil "$backup_file" "$gcs_path" || return 1
     elif [ "${GCS_UPLOAD_TOOL}" = "rclone" ]; then
-        upload_gcs_with_rclone "$backup_file" "$gcs_path"
+        upload_gcs_with_rclone "$backup_file" "$gcs_path" || return 1
     else
         log_error "Unknown GCS upload tool: ${GCS_UPLOAD_TOOL}"
         return 1
     fi
 
-    # Upload checksum file
+    # Upload checksum file (best-effort)
     if [ -f "$checksum_file" ]; then
         if [ "${GCS_UPLOAD_TOOL}" = "gsutil" ]; then
-            upload_gcs_with_gsutil "$checksum_file" "${gcs_path}.sha256"
+            upload_gcs_with_gsutil "$checksum_file" "${gcs_path}.sha256" || log_warn "Checksum upload failed"
         else
-            upload_gcs_with_rclone "$checksum_file" "${gcs_path}.sha256"
+            upload_gcs_with_rclone "$checksum_file" "${gcs_path}.sha256" || log_warn "Checksum upload failed"
         fi
     fi
+
+    return 0
 }
 
 upload_gcs_with_gsutil() {
@@ -603,23 +587,27 @@ upload_to_r2() {
 
     log_info "Uploading to R2: ${R2_BUCKET}/${R2_PREFIX}/${r2_path}"
 
+    # The data upload MUST succeed; if it fails, return failure now so the caller
+    # never deletes the local copy (KEEP_LOCAL_BACKUP). Checksum upload is best-effort.
     if [ "${R2_UPLOAD_TOOL}" = "awscli" ]; then
-        upload_r2_with_aws_cli "$backup_file" "$r2_path"
+        upload_r2_with_aws_cli "$backup_file" "$r2_path" || return 1
     elif [ "${R2_UPLOAD_TOOL}" = "rclone" ]; then
-        upload_r2_with_rclone "$backup_file" "$r2_path"
+        upload_r2_with_rclone "$backup_file" "$r2_path" || return 1
     else
         log_error "Unknown R2 upload tool: ${R2_UPLOAD_TOOL}"
         return 1
     fi
 
-    # Upload checksum file
+    # Upload checksum file (best-effort)
     if [ -f "$checksum_file" ]; then
         if [ "${R2_UPLOAD_TOOL}" = "awscli" ]; then
-            upload_r2_with_aws_cli "$checksum_file" "${r2_path}.sha256"
+            upload_r2_with_aws_cli "$checksum_file" "${r2_path}.sha256" || log_warn "Checksum upload failed"
         else
-            upload_r2_with_rclone "$checksum_file" "${r2_path}.sha256"
+            upload_r2_with_rclone "$checksum_file" "${r2_path}.sha256" || log_warn "Checksum upload failed"
         fi
     fi
+
+    return 0
 }
 
 upload_r2_with_aws_cli() {
@@ -704,7 +692,7 @@ Backup Details:
     fi
 
     if [ "${WEBHOOK_ENABLED}" = "true" ]; then
-        local payload='{"status":"success","message":"Octeth ClickHouse backup completed","timestamp":"%TIMESTAMP%","backup_size":"%SIZE%"}'
+        local payload='{"text":"✅ Octeth ClickHouse backup completed (%SIZE%) at %TIMESTAMP%","status":"success","backup_size":"%SIZE%","timestamp":"%TIMESTAMP%"}'
         payload="${payload//%TIMESTAMP%/$(date -Iseconds)}"
         payload="${payload//%SIZE%/${size}}"
         send_webhook "$payload"
@@ -730,7 +718,7 @@ Please check the log file: ${CH_LOG_FILE}
     fi
 
     if [ "${WEBHOOK_ENABLED}" = "true" ]; then
-        local payload='{"status":"failure","message":"Octeth ClickHouse backup failed","timestamp":"%TIMESTAMP%","error":"%ERROR%"}'
+        local payload='{"text":"🚨 Octeth ClickHouse backup FAILED at %TIMESTAMP%: %ERROR%","status":"failure","error":"%ERROR%","timestamp":"%TIMESTAMP%"}'
         payload="${payload//%TIMESTAMP%/$(date -Iseconds)}"
         payload="${payload//%ERROR%/${ERROR_LOG}}"
         send_webhook "$payload"
@@ -781,24 +769,21 @@ main() {
     # Determine backup type
     determine_backup_type
 
-    # Perform backup
-    local temp_backup_dir
-    if ! temp_backup_dir=$(perform_backup); then
-        send_notifications "failure"
-        exit 1
-    fi
-
-    # Compress backup
+    # Perform backup (clickhouse-backup create -> tar|compressor -> .tar.gz)
     local backup_file
-    if ! backup_file=$(compress_backup "$temp_backup_dir"); then
+    if ! backup_file=$(perform_backup); then
         send_notifications "failure"
         exit 1
     fi
 
     # Upload to cloud storage
-    upload_to_cloud "$backup_file" || log_warn "Cloud upload failed (continuing anyway)"
+    local upload_ok=true
+    if ! upload_to_cloud "$backup_file"; then
+        upload_ok=false
+        log_warn "Cloud upload failed (local copy retained for retry)"
+    fi
 
-    # Success
+    # Success banner + notification (while the file still exists, so size is known)
     local duration=$(($(date +%s) - BACKUP_START_TIME))
     log_success "=========================================="
     log_success "ClickHouse backup completed in ${duration}s"
@@ -806,6 +791,20 @@ main() {
     log_success "=========================================="
 
     send_notifications "success" "$backup_file"
+
+    # Remove the local copy when we don't keep local backups. Only delete once the
+    # backup is safely in the cloud — never delete the last remaining copy.
+    local keep_local="${KEEP_LOCAL_BACKUP:-true}"
+    if [ "${keep_local}" = "false" ]; then
+        if [ "${CLOUD_STORAGE_PROVIDER}" = "none" ]; then
+            log_warn "KEEP_LOCAL_BACKUP=false but CLOUD_STORAGE_PROVIDER=none; keeping local backup (nowhere else to store it)"
+        elif [ "${upload_ok}" = true ]; then
+            log_info "Removing local backup (KEEP_LOCAL_BACKUP=false); retained in ${CLOUD_STORAGE_PROVIDER}"
+            rm -f "${backup_file}" "${backup_file}.sha256"
+        else
+            log_warn "Keeping local backup because the cloud upload failed"
+        fi
+    fi
 
     exit 0
 }
