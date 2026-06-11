@@ -101,7 +101,7 @@ cleanup_directory() {
     local backup_files=()
     while IFS= read -r -d '' file; do
         backup_files+=("$file")
-    done < <(find "$dir" -maxdepth 1 -name "*.tar.gz" -type f -print0 2>/dev/null | xargs -0 ls -t 2>/dev/null | tr '\n' '\0')
+    done < <(find "$dir" -maxdepth 1 \( -name "*.tar.gz" -o -name "*.xbstream.gz" \) -type f -print0 2>/dev/null | xargs -0 ls -t 2>/dev/null | tr '\n' '\0')
     local total_backups=${#backup_files[@]}
 
     log_info "Found ${total_backups} ${backup_type} backup(s)"
@@ -198,7 +198,7 @@ cleanup_s3_with_aws_cli() {
 
         # List all backups in S3 for this type
         local s3_backups=($(aws s3 ls "s3://${S3_BUCKET}/${s3_prefix}" --region "${S3_REGION}" 2>/dev/null | \
-            grep "\.tar\.gz$" | sort -r | awk '{print $4}'))
+            grep -E "\.(tar|xbstream)\.gz$" | sort -r | awk '{print $4}'))
 
         local total=${#s3_backups[@]}
         verbose_log "Found ${total} ${backup_type} backups in S3"
@@ -252,7 +252,7 @@ cleanup_s3_with_rclone() {
         log_info "Cleaning up S3 ${backup_type} backups (keep last ${retention_count})"
 
         # List all backups
-        local s3_backups=($(rclone lsf "$remote_path" 2>/dev/null | grep "\.tar\.gz$" | sort -r))
+        local s3_backups=($(rclone lsf "$remote_path" 2>/dev/null | grep -E "\.(tar|xbstream)\.gz$" | sort -r))
 
         local total=${#s3_backups[@]}
         verbose_log "Found ${total} ${backup_type} backups in S3"
@@ -336,7 +336,7 @@ cleanup_gcs_with_gsutil() {
 
         # List all backups in GCS for this type
         local gcs_backups=($(gsutil ls "$gcs_prefix" 2>/dev/null | \
-            grep "\.tar\.gz$" | sort -r | xargs -n1 basename))
+            grep -E "\.(tar|xbstream)\.gz$" | sort -r | xargs -n1 basename))
 
         local total=${#gcs_backups[@]}
         verbose_log "Found ${total} ${backup_type} backups in GCS"
@@ -390,7 +390,7 @@ cleanup_gcs_with_rclone() {
         log_info "Cleaning up GCS ${backup_type} backups (keep last ${retention_count})"
 
         # List all backups
-        local gcs_backups=($(rclone lsf "$remote_path" 2>/dev/null | grep "\.tar\.gz$" | sort -r))
+        local gcs_backups=($(rclone lsf "$remote_path" 2>/dev/null | grep -E "\.(tar|xbstream)\.gz$" | sort -r))
 
         local total=${#gcs_backups[@]}
         verbose_log "Found ${total} ${backup_type} backups in GCS"
@@ -468,7 +468,7 @@ cleanup_r2_with_aws_cli() {
 
         # List all backups in R2 for this type
         local r2_backups=($(aws s3 ls "s3://${R2_BUCKET}/${r2_prefix}" --endpoint-url "${r2_endpoint}" 2>/dev/null | \
-            grep "\.tar\.gz$" | sort -r | awk '{print $4}'))
+            grep -E "\.(tar|xbstream)\.gz$" | sort -r | awk '{print $4}'))
 
         local total=${#r2_backups[@]}
         verbose_log "Found ${total} ${backup_type} backups in R2"
@@ -522,7 +522,7 @@ cleanup_r2_with_rclone() {
         log_info "Cleaning up R2 ${backup_type} backups (keep last ${retention_count})"
 
         # List all backups
-        local r2_backups=($(rclone lsf "$remote_path" 2>/dev/null | grep "\.tar\.gz$" | sort -r))
+        local r2_backups=($(rclone lsf "$remote_path" 2>/dev/null | grep -E "\.(tar|xbstream)\.gz$" | sort -r))
 
         local total=${#r2_backups[@]}
         verbose_log "Found ${total} ${backup_type} backups in R2"
@@ -586,7 +586,7 @@ show_statistics() {
         local dir="${!dir_var}"
 
         if [ -d "$dir" ]; then
-            local count=$(find "$dir" -maxdepth 1 -name "*.tar.gz" -type f | wc -l)
+            local count=$(find "$dir" -maxdepth 1 \( -name "*.tar.gz" -o -name "*.xbstream.gz" \) -type f | wc -l)
             local total_size=$(du -sh "$dir" 2>/dev/null | cut -f1 || echo "0")
             log_info "$(capitalize "$backup_type") backups: ${count} (${total_size})"
         fi

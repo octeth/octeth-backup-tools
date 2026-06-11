@@ -112,7 +112,7 @@ list_local_backups() {
         local backups=()
         while IFS= read -r -d '' file; do
             backups+=("$file")
-        done < <(find "$dir" -maxdepth 1 -name "*.tar.gz" -type f -print0 2>/dev/null | xargs -0 ls -t 2>/dev/null | tr '\n' '\0')
+        done < <(find "$dir" -maxdepth 1 \( -name "*.tar.gz" -o -name "*.xbstream.gz" \) -type f -print0 2>/dev/null | xargs -0 ls -t 2>/dev/null | tr '\n' '\0')
 
         if [ ${#backups[@]} -gt 0 ]; then
             echo ""
@@ -196,7 +196,7 @@ list_s3_with_aws_cli() {
         echo "----------------------------------------"
 
         aws s3 ls "s3://${S3_BUCKET}/${s3_prefix}" --region "${S3_REGION}" 2>/dev/null | \
-            grep "\.tar\.gz$" | sort -r | \
+            grep -E "\.(tar|xbstream)\.gz$" | sort -r | \
             awk '{printf "  %-50s  %8s %s  %s %s\n", $4, $3, $2, $1, $2}'
     done
 }
@@ -214,7 +214,7 @@ list_s3_with_rclone() {
         echo "$(capitalize "$backup_type") Backups (S3):"
         echo "----------------------------------------"
 
-        rclone lsl "$remote_path" 2>/dev/null | grep "\.tar\.gz$" | sort -r
+        rclone lsl "$remote_path" 2>/dev/null | grep -E "\.(tar|xbstream)\.gz$" | sort -r
     done
 }
 
@@ -265,7 +265,7 @@ list_gcs_with_gsutil() {
         echo "----------------------------------------"
 
         gsutil ls -l "$gcs_prefix" 2>/dev/null | \
-            grep "\.tar\.gz$" | sort -r | \
+            grep -E "\.(tar|xbstream)\.gz$" | sort -r | \
             awk '{printf "  %-50s  %8s  %s %s\n", $3, $1, $2, ""}'
     done
 }
@@ -283,7 +283,7 @@ list_gcs_with_rclone() {
         echo "$(capitalize "$backup_type") Backups (GCS):"
         echo "----------------------------------------"
 
-        rclone lsl "$remote_path" 2>/dev/null | grep "\.tar\.gz$" | sort -r
+        rclone lsl "$remote_path" 2>/dev/null | grep -E "\.(tar|xbstream)\.gz$" | sort -r
     done
 }
 
@@ -328,7 +328,7 @@ list_r2_with_aws_cli() {
         echo "----------------------------------------"
 
         aws s3 ls "s3://${R2_BUCKET}/${r2_prefix}" --endpoint-url "${r2_endpoint}" 2>/dev/null | \
-            grep "\.tar\.gz$" | sort -r | \
+            grep -E "\.(tar|xbstream)\.gz$" | sort -r | \
             awk '{printf "  %-50s  %8s %s  %s %s\n", $4, $3, $2, $1, $2}'
     done
 }
@@ -346,7 +346,7 @@ list_r2_with_rclone() {
         echo "$(capitalize "$backup_type") Backups (R2):"
         echo "----------------------------------------"
 
-        rclone lsl "$remote_path" 2>/dev/null | grep "\.tar\.gz$" | sort -r
+        rclone lsl "$remote_path" 2>/dev/null | grep -E "\.(tar|xbstream)\.gz$" | sort -r
     done
 }
 
@@ -640,25 +640,78 @@ perform_restore() {
         fi
     fi
 
-    # Extract backup
+    # Extract backup. Two formats are supported:
+    #   *.xbstream.gz  - streamed backup (current): decompress -> xbstream -x -> prepare
+    #   *.tar.gz       - legacy backup: tar -xzf (already prepared at backup time)
     local extract_dir="${TEMP_DIR}/restore-$(date +%s)"
     mkdir -p "$extract_dir"
+    local backup_dir=""
 
-    log_info "Extracting backup..."
-    if tar -xzf "$backup_file" -C "$extract_dir"; then
-        log_success "Backup extracted to: $extract_dir"
-    else
-        log_error "Failed to extract backup"
-        exit 1
-    fi
+    case "$backup_file" in
+        *.xbstream.gz|*.xbstream)
+            if ! command -v xbstream &> /dev/null; then
+                log_error "xbstream not found (ships with Percona XtraBackup). Cannot restore xbstream backup."
+                exit 1
+            fi
 
-    # Find the backup directory inside the extracted archive
-    local backup_dir=$(find "$extract_dir" -maxdepth 1 -type d -name "${BACKUP_PREFIX}-*" | head -n1)
+            # Pick a decompressor (pigz can read gzip streams too)
+            local decomp="gzip -dc"
+            command -v pigz &> /dev/null && decomp="pigz -dc"
 
-    if [ -z "$backup_dir" ] || [ ! -d "$backup_dir" ]; then
-        log_error "Cannot find backup directory in extracted archive"
-        exit 1
-    fi
+            log_info "Extracting xbstream backup..."
+            case "$backup_file" in
+                *.gz)
+                    if ! ${decomp} "$backup_file" | xbstream -x -C "$extract_dir"; then
+                        log_error "Failed to extract xbstream backup"
+                        exit 1
+                    fi
+                    ;;
+                *)
+                    if ! xbstream -x -C "$extract_dir" < "$backup_file"; then
+                        log_error "Failed to extract xbstream backup"
+                        exit 1
+                    fi
+                    ;;
+            esac
+            log_success "Backup extracted to: $extract_dir"
+
+            # Streamed backups are not prepared at backup time; do it now so the
+            # data directory is consistent and restorable.
+            log_info "Preparing backup (applying transaction logs)..."
+            if ${XTRABACKUP_BIN} --prepare --target-dir="$extract_dir" >> "${LOG_FILE}" 2>&1; then
+                log_success "Backup prepared successfully"
+            else
+                log_error "Backup prepare failed (see ${LOG_FILE})"
+                exit 1
+            fi
+
+            # xbstream extracts the data files directly into extract_dir
+            backup_dir="$extract_dir"
+            ;;
+
+        *.tar.gz)
+            log_info "Extracting backup..."
+            if tar -xzf "$backup_file" -C "$extract_dir"; then
+                log_success "Backup extracted to: $extract_dir"
+            else
+                log_error "Failed to extract backup"
+                exit 1
+            fi
+
+            # Legacy archives wrap the (already prepared) data in a backup-name dir
+            backup_dir=$(find "$extract_dir" -maxdepth 1 -type d -name "${BACKUP_PREFIX}-*" | head -n1)
+
+            if [ -z "$backup_dir" ] || [ ! -d "$backup_dir" ]; then
+                log_error "Cannot find backup directory in extracted archive"
+                exit 1
+            fi
+            ;;
+
+        *)
+            log_error "Unknown backup format: $backup_file (expected *.xbstream.gz or *.tar.gz)"
+            exit 1
+            ;;
+    esac
 
     # Stop MySQL
     log_info "Stopping MySQL container..."

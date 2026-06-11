@@ -6,13 +6,14 @@ A professional, production-ready backup solution for Octeth supporting both **My
 
 - **Zero-Downtime Hot Backups**: MySQL via Percona XtraBackup, ClickHouse via clickhouse-backup
 - **Multi-Database Support**: Independent backup/restore/cleanup for MySQL and ClickHouse
+- **Streaming Compression**: Backups are streamed straight into the compressor and written to disk once, already compressed — no large uncompressed staging copy (MySQL uses `xbstream`)
+- **No-Local Mode**: Optionally delete the local copy right after a successful cloud upload (`KEEP_LOCAL_BACKUP=false`) so the disk never fills up
 - **Smart Retention Policy**: Daily (7 days) + Weekly (4 weeks) + Monthly (6 months)
 - **Cloud Storage**: Local filesystem + AWS S3, Google Cloud Storage, or Cloudflare R2
 - **Production-Ready**: Comprehensive error handling, logging, and notifications
-- **Fast & Efficient**: Physical backups with minimal CPU and zero downtime
 - **Parallel Compression**: Supports pigz for faster compression
-- **Easy Restore**: Simple restore process with checksum verification
-- **Automated Cleanup**: Automatic retention policy enforcement
+- **Easy Restore**: Single command; reads both the new `.xbstream.gz` and legacy `.tar.gz` formats
+- **One-Command Deploy**: `deploy.sh` rsyncs the tool to a server (delta transfer + rollback backup)
 
 ## Why Physical Backups?
 
@@ -290,14 +291,25 @@ CH_LOG_FILE=/var/log/octeth-ch-backup.log # Log file
 
 #### Backup Storage (MySQL)
 ```bash
-BACKUP_DIR=/var/backups/octeth      # Local backup directory
-TEMP_DIR=/var/backups/octeth/tmp    # Temporary directory (CRITICAL: needs DB size + 20% free space)
-                                     # WARNING: Do NOT use /tmp - often too small!
+BACKUP_DIR=/var/backups/octeth      # Where compressed backups are written before upload
+KEEP_LOCAL_BACKUP=true              # false = delete local copy after a successful cloud upload
+                                     # (applies to BOTH MySQL and ClickHouse)
+TEMP_DIR=/var/backups/octeth/tmp    # Used by RESTORE (extract + prepare); avoid /tmp
 MAX_DISK_USAGE=85                   # Maximum disk usage % (abort if exceeded)
 MIN_FREE_SPACE_GB=10                # Minimum free space required
 ```
 
-**IMPORTANT:** `TEMP_DIR` must have enough space for the full uncompressed database backup. The script calculates required space as: Database Size + 20% buffer + 5GB. Using `/tmp` will likely cause "No space left on device" errors for databases larger than a few GB.
+**Disk space:** Backups stream and compress on the fly, so a backup only writes the final compressed `.xbstream.gz` (typically ~40% of the data directory) into `BACKUP_DIR`. With `KEEP_LOCAL_BACKUP=false` it's deleted right after upload, so the disk only holds it transiently. `TEMP_DIR` is now a **restore**-time concern — restore extracts the full uncompressed database there.
+
+#### Binary logs (MySQL, optional)
+```bash
+MYSQL_LOG_BIN=                   # Binlog basename on HOST; set ONLY if binary logging is
+                                 # enabled AND binlogs live outside the data dir.
+                                 # Passed as --log-bin; index auto-derived as <basename>.index.
+MYSQL_LOG_BIN_INDEX=             # Override the derived index path (rarely needed)
+```
+
+If a MySQL backup fails with `cannot open binlog index file`, set `MYSQL_LOG_BIN` to the host binlog basename (e.g. `/opt/oempro/_dockerfiles/mysql/log_v8/mysql-bin`). Leave empty when binary logging is disabled (`skip-log-bin`).
 
 #### Compression
 ```bash
@@ -370,7 +382,7 @@ WEBHOOK_URL=                     # Webhook URL
 
 #### Advanced Settings
 ```bash
-VERIFY_BACKUP=true               # Verify backup after creation
+VERIFY_BACKUP=true               # Integrity-check the compressed archive (prepare runs at restore)
 LOCK_FILE=/tmp/octeth-backup.lock # Lock file path
 LOG_FILE=/var/log/octeth-backup.log # Log file path
 LOG_RETENTION_DAYS=30            # Keep logs for N days
@@ -620,6 +632,23 @@ grep ERROR /var/log/octeth-ch-backup.log
 
 Logs are automatically rotated and cleaned up after 30 days.
 
+## Deployment
+
+`deploy.sh` rsyncs the tool to a server, transferring only changed files and saving any overwritten file to a timestamped backup dir on the server (so a deploy can be rolled back). The live secret config (`config/.env`, `config/backup.conf`) is **excluded by default** so the server's credentials are never clobbered.
+
+```bash
+# Preview (no changes)
+DEPLOY_HOST=my-server ./deploy.sh --dry-run
+
+# Deploy code (leaves server config/.env untouched)
+./deploy.sh --host my-server
+
+# One-off: also push the local config/.env + backup.conf
+./deploy.sh --host my-server --include-env
+```
+
+Host/user/path/port are flags or env vars (`DEPLOY_HOST`, `DEPLOY_USER`, `DEPLOY_PATH` default `/opt/octeth-backup-tools`, `SSH_PORT`). Because config is excluded by default, set new config keys (e.g. `KEEP_LOCAL_BACKUP`, `MYSQL_LOG_BIN`) directly on the server's `config/.env` after a code-only deploy. It does **not** use `rsync --append` (which would corrupt code files); `--partial` is available for resumable transfers.
+
 ## Cron Setup
 
 The installer creates cron jobs automatically:
@@ -763,52 +792,30 @@ DOCKER_CMD="sudo docker"
 
 ### Backup Fails: "No space left on device"
 
-This is a critical error that occurs when XtraBackup runs out of disk space during backup. This can also cause MySQL to crash or become unresponsive.
+Since backups stream and compress on the fly, only the final compressed file is written (into `BACKUP_DIR`) — there is no large uncompressed staging copy. So this error now points at `BACKUP_DIR` running low, not `TEMP_DIR`.
 
 **Symptoms:**
 ```
 xtrabackup: Error writing file ... (OS errno 28 - No space left on device)
 ```
 
-**Cause:** The `TEMP_DIR` (default: `/tmp/octeth-backup`) doesn't have enough space for the uncompressed database backup.
-
 **Solution:**
 
-1. **Change TEMP_DIR location** (recommended):
+1. **Check space on the backup disk:**
    ```bash
-   # Edit config/.env
-   TEMP_DIR=/var/backups/octeth/tmp  # Use same disk as backups
-   ```
-
-2. **Check space requirements:**
-   ```bash
-   # Check database size
-   du -sh /opt/oempro/_dockerfiles/mysql/data_v8
-
-   # Check available space in temp directory
    df -h /var/backups
-
-   # Rule: TEMP_DIR needs DB size + 20% + 5GB free
-   # Example: 10GB database needs ~17GB free in TEMP_DIR
+   du -sh /opt/oempro/_dockerfiles/mysql/data_v8   # ~40% of this is the compressed backup size
    ```
 
-3. **Clean up temp directory:**
-   ```bash
-   # Remove any stale temp files
-   rm -rf /var/backups/octeth/tmp/*
-   ```
+2. **Free space / tighten retention:** lower `RETENTION_*`, or set `KEEP_LOCAL_BACKUP=false` to keep backups only in the cloud, then run the cleanup script.
 
-4. **If MySQL crashed during backup:**
+3. **If MySQL crashed during backup:**
    ```bash
-   # Restart MySQL container
    docker restart oempro_mysql
-
-   # Verify MySQL is healthy
    docker logs oempro_mysql
-   docker exec oempro_mysql mysql -uroot -p'password' -e "SHOW STATUS LIKE 'Uptime';"
    ```
 
-**Prevention:** Always ensure TEMP_DIR has sufficient space before running backups. The script now checks this automatically and will abort with a clear error if space is insufficient.
+> **Restore** is the operation that now needs a large `TEMP_DIR` — it extracts and prepares the full uncompressed database there. Ensure `TEMP_DIR` has room for the uncompressed DB before restoring.
 
 ### S3 Upload Fails
 
@@ -1207,6 +1214,16 @@ For issues, questions, or contributions:
 - Octeth Support: support@octeth.com
 
 ## Changelog
+
+### v1.2.0
+- **Streaming MySQL backups**: `xtrabackup --stream=xbstream` piped straight into the compressor → `*.xbstream.gz` written once; no uncompressed temp staging and no separate tar pass
+- **`MYSQL_LOG_BIN` / `MYSQL_LOG_BIN_INDEX`**: capture binary logs when they live outside the data directory (auto-derived `--log-bin-index`)
+- **`VERIFY_BACKUP`** now integrity-checks the compressed archive; the prepare/apply-logs step moved to restore time
+- **`KEEP_LOCAL_BACKUP`** (MySQL + ClickHouse): delete the local copy after a successful cloud upload; uploads return failure on data-upload errors so the last copy is never deleted
+- **ClickHouse**: archive straight from the `clickhouse-backup` output (tar → compressor), removing the extra `CH_TEMP_DIR` copy
+- **Restore** reads both `.xbstream.gz` and legacy `.tar.gz`; cleanup matches both
+- **`deploy.sh`**: rsync delta deploy with on-server rollback backups
+- Slack-compatible webhook payloads (added a `text` field)
 
 ### v1.1.0 (2026-03-16)
 - ClickHouse backup support using clickhouse-backup (Altinity)

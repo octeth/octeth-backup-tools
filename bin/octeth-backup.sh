@@ -121,15 +121,14 @@ check_xtrabackup() {
 }
 
 check_disk_space() {
-    local backup_dir_parent=$(dirname "${BACKUP_DIR}")
-
-    # Create backup and temp directories if they don't exist
+    # Streaming backups compress on the fly, so only the final compressed
+    # artifact lands on disk in BACKUP_DIR (and, with KEEP_LOCAL_BACKUP=false,
+    # only transiently until it is uploaded). No uncompressed staging copy is
+    # written anymore, so we only validate the backup destination.
     mkdir -p "${BACKUP_DIR}"
-    mkdir -p "${TEMP_DIR}"
 
-    # Check disk usage for backup directory
-    local disk_usage=$(df -h "${backup_dir_parent}" | awk 'NR==2 {print $5}' | sed 's/%//')
-    local free_space_gb=$(df -BG "${backup_dir_parent}" | awk 'NR==2 {print $4}' | sed 's/G//')
+    local disk_usage=$(df -h "${BACKUP_DIR}" | awk 'NR==2 {print $5}' | sed 's/%//')
+    local free_space_gb=$(df -BG "${BACKUP_DIR}" | awk 'NR==2 {print $4}' | sed 's/G//')
 
     if [ "$disk_usage" -gt "$MAX_DISK_USAGE" ]; then
         log_error "Backup directory disk usage is ${disk_usage}% (threshold: ${MAX_DISK_USAGE}%)"
@@ -141,29 +140,22 @@ check_disk_space() {
         exit 1
     fi
 
-    log_info "Backup directory disk check passed: ${free_space_gb}GB free, ${disk_usage}% used"
-
-    # Check disk space for temp directory (critical for XtraBackup)
-    local temp_disk_usage=$(df -h "${TEMP_DIR}" | awk 'NR==2 {print $5}' | sed 's/%//')
-    local temp_free_space_gb=$(df -BG "${TEMP_DIR}" | awk 'NR==2 {print $4}' | sed 's/G//')
-
-    # Estimate required space (database size + 20% buffer)
+    # Rough sanity check: a compressed xbstream is typically ~40% of the data
+    # directory size. Abort early if the destination clearly cannot hold it.
     if [ -d "${MYSQL_DATA_DIR}" ]; then
         local db_size_gb=$(du -sb "${MYSQL_DATA_DIR}" 2>/dev/null | awk '{print int($1/1024/1024/1024)}')
-        local required_space=$((db_size_gb + db_size_gb / 5 + 5))  # DB size + 20% + 5GB buffer
+        local est_compressed=$((db_size_gb * 2 / 5 + 1))  # ~40% of DB + 1GB buffer
 
-        log_info "Database size: ~${db_size_gb}GB, temp directory has ${temp_free_space_gb}GB free"
+        log_info "Database size: ~${db_size_gb}GB, estimated compressed backup: ~${est_compressed}GB, ${free_space_gb}GB free"
 
-        if [ "$temp_free_space_gb" -lt "$required_space" ]; then
-            log_error "Insufficient space in temp directory!"
-            log_error "Required: ~${required_space}GB, Available: ${temp_free_space_gb}GB"
-            log_error "Please increase TEMP_DIR space or set TEMP_DIR to a location with more space"
-            log_error "Recommended: TEMP_DIR=/var/backups/octeth/tmp (same disk as backups)"
+        if [ "$free_space_gb" -lt "$est_compressed" ]; then
+            log_error "Insufficient space for compressed backup in ${BACKUP_DIR}"
+            log_error "Estimated required: ~${est_compressed}GB, Available: ${free_space_gb}GB"
             exit 1
         fi
     fi
 
-    log_info "Temp directory disk check passed: ${temp_free_space_gb}GB free, ${temp_disk_usage}% used"
+    log_info "Backup directory disk check passed: ${free_space_gb}GB free, ${disk_usage}% used"
 }
 
 check_mysql_connection() {
@@ -225,11 +217,12 @@ determine_backup_type() {
 # ============================================
 
 perform_backup() {
-    log_info "Starting XtraBackup hot backup (zero downtime)"
+    log_info "Starting XtraBackup streaming hot backup (zero downtime)"
 
-    # Create temporary directory for backup
-    mkdir -p "${TEMP_DIR}"
-    local temp_backup_dir="${TEMP_DIR}/${BACKUP_NAME}"
+    # Final compressed artifact. We stream xbstream straight into the compressor,
+    # so the backup is written to disk exactly once, already compressed. There is
+    # no uncompressed staging copy and no separate tar/compress pass.
+    local dest_file="${BACKUP_DEST}/${BACKUP_NAME}.xbstream.gz"
 
     # Determine number of parallel threads
     local threads="${PARALLEL_THREADS}"
@@ -268,7 +261,7 @@ perform_backup() {
     else
         log_info "Connecting to MySQL via exposed port: ${mysql_host}:${mysql_port}"
     fi
-    
+
     # Verify MySQL data directory exists
     if [ ! -d "${MYSQL_DATA_DIR}" ]; then
         log_error "MySQL data directory not found: ${MYSQL_DATA_DIR}"
@@ -280,70 +273,76 @@ perform_backup() {
 
     log_info "MySQL data directory: ${MYSQL_DATA_DIR}"
 
-    # Run XtraBackup from HOST (not inside container)
-    log_info "Running: xtrabackup --backup"
+    # Binary logs often live outside the data directory (e.g. a sibling log_v8/).
+    # When MYSQL_LOG_BIN is set, XtraBackup is told the binlog basename so it can
+    # capture the binlog and its coordinates; without it the backup can fail.
+    #
+    # The binlog *index* file is read from a SEPARATE path (the server's
+    # log_bin_index variable), which a containerized MySQL reports as its
+    # in-container path (e.g. /var/log/mysql/mysql-bin.index) — a path that does
+    # not exist on the host where xtrabackup runs. We therefore also pass
+    # --log-bin-index. By convention the index sits next to the binlogs as
+    # <basename>.index, so we derive it from MYSQL_LOG_BIN unless MYSQL_LOG_BIN_INDEX
+    # is set explicitly. Leave MYSQL_LOG_BIN empty if binary logging is disabled.
+    local log_bin_opt=""
+    local log_bin_index_opt=""
+    if [ -n "${MYSQL_LOG_BIN:-}" ]; then
+        log_bin_opt="--log-bin=${MYSQL_LOG_BIN}"
+        local log_bin_index="${MYSQL_LOG_BIN_INDEX:-${MYSQL_LOG_BIN}.index}"
+        log_bin_index_opt="--log-bin-index=${log_bin_index}"
+        log_info "Including binary logs: ${MYSQL_LOG_BIN} (index: ${log_bin_index})"
+    fi
 
-    if ${XTRABACKUP_BIN} --backup \
-        --target-dir="${temp_backup_dir}" \
+    # Run XtraBackup from HOST (not inside container) and stream the xbstream
+    # output directly into the compressor. pipefail (set -o pipefail) makes the
+    # whole pipeline fail if either xtrabackup or the compressor fails.
+    log_info "Streaming backup to: ${dest_file} (compressed with ${COMPRESSION_TOOL})"
+
+    if ionice -c 3 nice -n 19 ${XTRABACKUP_BIN} --backup \
         --datadir="${MYSQL_DATA_DIR}" \
         --host="${mysql_host}" \
         --port="${mysql_port}" \
         --user=root \
         --password="${MYSQL_ROOT_PASSWORD}" \
         --parallel=${threads} \
-        ${XTRABACKUP_EXTRA_OPTS} >> "${LOG_FILE}" 2>&1; then
-        log_success "XtraBackup completed successfully"
+        ${log_bin_opt} \
+        ${log_bin_index_opt} \
+        --stream=xbstream \
+        ${XTRABACKUP_EXTRA_OPTS:-} 2>> "${LOG_FILE}" \
+        | ${COMPRESSION_TOOL} -${COMPRESSION_LEVEL} > "${dest_file}"; then
+        log_success "XtraBackup stream completed"
     else
-        log_error "XtraBackup failed"
+        log_error "XtraBackup streaming backup failed"
+        rm -f "${dest_file}"
         EXIT_CODE=1
         return 1
     fi
 
-    # Prepare the backup (make it consistent)
+    # A streamed backup cannot be prepared in place; the prepare step now happens
+    # at restore time (octeth-restore.sh). Here we instead validate that the
+    # compressed archive is intact (not truncated/corrupt), which is cheap.
     if [ "${VERIFY_BACKUP}" = "true" ]; then
-        log_info "Preparing backup (applying transaction logs)"
+        log_info "Verifying compressed backup integrity"
 
-        if ${XTRABACKUP_BIN} --prepare --target-dir="${temp_backup_dir}" >> "${LOG_FILE}" 2>&1; then
-            log_success "Backup prepared successfully (ready for restore)"
+        if ${COMPRESSION_TOOL} -t "${dest_file}" 2>> "${LOG_FILE}"; then
+            log_success "Backup integrity check passed"
         else
-            log_error "Backup prepare failed"
+            log_error "Backup integrity check failed (corrupt or truncated archive)"
+            rm -f "${dest_file}"
             EXIT_CODE=1
             return 1
         fi
     fi
 
-    echo "${temp_backup_dir}"
-}
+    # Size + checksum
+    local size=$(du -h "${dest_file}" | cut -f1)
+    log_info "Backup size: ${size}"
 
-compress_backup() {
-    local source_dir="$1"
-    local dest_file="${BACKUP_DEST}/${BACKUP_NAME}.tar.gz"
+    local checksum=$(sha256sum "${dest_file}" | cut -d' ' -f1)
+    echo "${checksum}  ${BACKUP_NAME}.xbstream.gz" > "${dest_file}.sha256"
+    log_info "Checksum: ${checksum}"
 
-    log_info "Compressing backup with ${COMPRESSION_TOOL}"
-
-    # Get parent directory and backup directory name
-    local parent_dir=$(dirname "${source_dir}")
-    local backup_dirname=$(basename "${source_dir}")
-
-    # Compress backup using tar and pigz/gzip
-    if tar -cf - -C "${parent_dir}" "${backup_dirname}" | ${COMPRESSION_TOOL} -${COMPRESSION_LEVEL} > "${dest_file}"; then
-        log_success "Backup compressed: ${dest_file}"
-
-        # Calculate size
-        local size=$(du -h "${dest_file}" | cut -f1)
-        log_info "Backup size: ${size}"
-
-        # Create checksum
-        local checksum=$(sha256sum "${dest_file}" | cut -d' ' -f1)
-        echo "${checksum}  ${BACKUP_NAME}.tar.gz" > "${dest_file}.sha256"
-        log_info "Checksum: ${checksum}"
-
-        echo "${dest_file}"
-    else
-        log_error "Compression failed"
-        EXIT_CODE=1
-        return 1
-    fi
+    echo "${dest_file}"
 }
 
 # ============================================
@@ -379,23 +378,27 @@ upload_to_s3() {
 
     log_info "Uploading to S3: s3://${S3_BUCKET}/${S3_PREFIX}/${s3_path}"
 
+    # The data upload MUST succeed; if it fails, return failure now so the caller
+    # never deletes the local copy (KEEP_LOCAL_BACKUP). Checksum upload is best-effort.
     if [ "${S3_UPLOAD_TOOL}" = "awscli" ]; then
-        upload_s3_with_aws_cli "$backup_file" "$s3_path"
+        upload_s3_with_aws_cli "$backup_file" "$s3_path" || return 1
     elif [ "${S3_UPLOAD_TOOL}" = "rclone" ]; then
-        upload_s3_with_rclone "$backup_file" "$s3_path"
+        upload_s3_with_rclone "$backup_file" "$s3_path" || return 1
     else
         log_error "Unknown S3 upload tool: ${S3_UPLOAD_TOOL}"
         return 1
     fi
 
-    # Upload checksum file
+    # Upload checksum file (best-effort)
     if [ -f "$checksum_file" ]; then
         if [ "${S3_UPLOAD_TOOL}" = "awscli" ]; then
-            upload_s3_with_aws_cli "$checksum_file" "${s3_path}.sha256"
+            upload_s3_with_aws_cli "$checksum_file" "${s3_path}.sha256" || log_warn "Checksum upload failed"
         else
-            upload_s3_with_rclone "$checksum_file" "${s3_path}.sha256"
+            upload_s3_with_rclone "$checksum_file" "${s3_path}.sha256" || log_warn "Checksum upload failed"
         fi
     fi
+
+    return 0
 }
 
 upload_s3_with_aws_cli() {
@@ -451,23 +454,27 @@ upload_to_gcs() {
 
     log_info "Uploading to GCS: gs://${GCS_BUCKET}/${GCS_PREFIX}/${gcs_path}"
 
+    # The data upload MUST succeed; if it fails, return failure now so the caller
+    # never deletes the local copy (KEEP_LOCAL_BACKUP). Checksum upload is best-effort.
     if [ "${GCS_UPLOAD_TOOL}" = "gsutil" ]; then
-        upload_gcs_with_gsutil "$backup_file" "$gcs_path"
+        upload_gcs_with_gsutil "$backup_file" "$gcs_path" || return 1
     elif [ "${GCS_UPLOAD_TOOL}" = "rclone" ]; then
-        upload_gcs_with_rclone "$backup_file" "$gcs_path"
+        upload_gcs_with_rclone "$backup_file" "$gcs_path" || return 1
     else
         log_error "Unknown GCS upload tool: ${GCS_UPLOAD_TOOL}"
         return 1
     fi
 
-    # Upload checksum file
+    # Upload checksum file (best-effort)
     if [ -f "$checksum_file" ]; then
         if [ "${GCS_UPLOAD_TOOL}" = "gsutil" ]; then
-            upload_gcs_with_gsutil "$checksum_file" "${gcs_path}.sha256"
+            upload_gcs_with_gsutil "$checksum_file" "${gcs_path}.sha256" || log_warn "Checksum upload failed"
         else
-            upload_gcs_with_rclone "$checksum_file" "${gcs_path}.sha256"
+            upload_gcs_with_rclone "$checksum_file" "${gcs_path}.sha256" || log_warn "Checksum upload failed"
         fi
     fi
+
+    return 0
 }
 
 upload_gcs_with_gsutil() {
@@ -538,23 +545,27 @@ upload_to_r2() {
 
     log_info "Uploading to R2: https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com/${R2_BUCKET}/${R2_PREFIX}/${r2_path}"
 
+    # The data upload MUST succeed; if it fails, return failure now so the caller
+    # never deletes the local copy (KEEP_LOCAL_BACKUP). Checksum upload is best-effort.
     if [ "${R2_UPLOAD_TOOL}" = "awscli" ]; then
-        upload_r2_with_aws_cli "$backup_file" "$r2_path"
+        upload_r2_with_aws_cli "$backup_file" "$r2_path" || return 1
     elif [ "${R2_UPLOAD_TOOL}" = "rclone" ]; then
-        upload_r2_with_rclone "$backup_file" "$r2_path"
+        upload_r2_with_rclone "$backup_file" "$r2_path" || return 1
     else
         log_error "Unknown R2 upload tool: ${R2_UPLOAD_TOOL}"
         return 1
     fi
 
-    # Upload checksum file
+    # Upload checksum file (best-effort)
     if [ -f "$checksum_file" ]; then
         if [ "${R2_UPLOAD_TOOL}" = "awscli" ]; then
-            upload_r2_with_aws_cli "$checksum_file" "${r2_path}.sha256"
+            upload_r2_with_aws_cli "$checksum_file" "${r2_path}.sha256" || log_warn "Checksum upload failed"
         else
-            upload_r2_with_rclone "$checksum_file" "${r2_path}.sha256"
+            upload_r2_with_rclone "$checksum_file" "${r2_path}.sha256" || log_warn "Checksum upload failed"
         fi
     fi
+
+    return 0
 }
 
 upload_r2_with_aws_cli() {
@@ -704,6 +715,8 @@ send_webhook() {
 # ============================================
 
 main() {
+    ulimit -n 65536
+
     log_info "=========================================="
     log_info "Octeth MySQL Backup Started"
     log_info "=========================================="
@@ -718,24 +731,21 @@ main() {
     # Determine backup type
     determine_backup_type
 
-    # Perform backup
-    local temp_backup_dir
-    if ! temp_backup_dir=$(perform_backup); then
-        send_notifications "failure"
-        exit 1
-    fi
-
-    # Compress backup
+    # Perform streaming backup (xbstream -> compressor -> single compressed file)
     local backup_file
-    if ! backup_file=$(compress_backup "$temp_backup_dir"); then
+    if ! backup_file=$(perform_backup); then
         send_notifications "failure"
         exit 1
     fi
 
     # Upload to cloud storage
-    upload_to_cloud "$backup_file" || log_warn "Cloud upload failed (continuing anyway)"
+    local upload_ok=true
+    if ! upload_to_cloud "$backup_file"; then
+        upload_ok=false
+        log_warn "Cloud upload failed (local copy retained for retry)"
+    fi
 
-    # Success
+    # Success banner + notification (while the file still exists, so size is known)
     local duration=$(($(date +%s) - BACKUP_START_TIME))
     log_success "=========================================="
     log_success "Backup completed in ${duration}s"
@@ -743,6 +753,20 @@ main() {
     log_success "=========================================="
 
     send_notifications "success" "$backup_file"
+
+    # Remove the local copy when we don't keep local backups. Only delete once the
+    # backup is safely in the cloud — never delete the last remaining copy.
+    local keep_local="${KEEP_LOCAL_BACKUP:-true}"
+    if [ "${keep_local}" = "false" ]; then
+        if [ "${CLOUD_STORAGE_PROVIDER}" = "none" ]; then
+            log_warn "KEEP_LOCAL_BACKUP=false but CLOUD_STORAGE_PROVIDER=none; keeping local backup (nowhere else to store it)"
+        elif [ "${upload_ok}" = true ]; then
+            log_info "Removing local backup (KEEP_LOCAL_BACKUP=false); retained in ${CLOUD_STORAGE_PROVIDER}"
+            rm -f "${backup_file}" "${backup_file}.sha256"
+        else
+            log_warn "Keeping local backup because the cloud upload failed"
+        fi
+    fi
 
     exit 0
 }

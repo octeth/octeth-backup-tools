@@ -32,19 +32,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # ============================================
 
 log_info() {
-    echo -e "${BLUE}[INFO]${NC} $@"
+    echo -e "${BLUE}[INFO]${NC} $*"
 }
 
 log_success() {
-    echo -e "${GREEN}[SUCCESS]${NC} $@"
+    echo -e "${GREEN}[SUCCESS]${NC} $*"
 }
 
 log_warn() {
-    echo -e "${YELLOW}[WARN]${NC} $@"
+    echo -e "${YELLOW}[WARN]${NC} $*"
 }
 
 log_error() {
-    echo -e "${RED}[ERROR]${NC} $@"
+    echo -e "${RED}[ERROR]${NC} $*"
 }
 
 # ============================================
@@ -267,23 +267,38 @@ check_aws_cli() {
 }
 
 install_aws_cli() {
-    log_info "Installing AWS CLI..."
+    log_info "Installing AWS CLI v2 (official installer)..."
 
-    if command -v pip3 &> /dev/null; then
-        sudo pip3 install awscli
-    elif command -v pip &> /dev/null; then
-        sudo pip install awscli
-    else
-        log_warn "pip not found, using package manager..."
-        local pkg_mgr=$(detect_package_manager)
+    local pkg_mgr=$(detect_package_manager)
+    local arch=$(uname -m)   # x86_64 or aarch64 — matches AWS download naming
 
+    # The v2 installer needs curl + unzip
+    if ! command -v unzip &> /dev/null; then
+        log_info "Installing unzip (required for the AWS CLI v2 installer)..."
         case "$pkg_mgr" in
-            apt)
-                sudo apt-get install -y awscli
-                ;;
-            yum|dnf)
-                sudo $pkg_mgr install -y awscli
-                ;;
+            apt) sudo apt-get install -y unzip ;;
+            yum|dnf) sudo "$pkg_mgr" install -y unzip ;;
+        esac
+    fi
+
+    if command -v curl &> /dev/null && command -v unzip &> /dev/null; then
+        local tmp
+        tmp=$(mktemp -d)
+        if curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-${arch}.zip" -o "${tmp}/awscliv2.zip" \
+            && unzip -q "${tmp}/awscliv2.zip" -d "${tmp}"; then
+            sudo "${tmp}/aws/install" --update
+        else
+            log_warn "AWS CLI v2 download/extract failed"
+        fi
+        rm -rf "${tmp}"
+    fi
+
+    # Fall back to the distro package if v2 didn't land
+    if ! check_aws_cli; then
+        log_warn "Falling back to the distribution AWS CLI package"
+        case "$pkg_mgr" in
+            apt) sudo apt-get install -y awscli ;;
+            yum|dnf) sudo "$pkg_mgr" install -y awscli ;;
             *)
                 log_error "Cannot install AWS CLI automatically"
                 log_error "Please install manually: https://aws.amazon.com/cli/"
@@ -294,6 +309,9 @@ install_aws_cli() {
 
     if check_aws_cli; then
         log_success "AWS CLI installed successfully"
+    else
+        log_error "AWS CLI installation failed"
+        return 1
     fi
 }
 
@@ -568,6 +586,11 @@ run_config_wizard() {
         cp "${SCRIPT_DIR}/config/.env.example" "$env_file"
     fi
 
+    # The storage test (offered below) sources backup.conf, so make sure it exists
+    if [ ! -f "${SCRIPT_DIR}/config/backup.conf" ]; then
+        cp "${SCRIPT_DIR}/config/backup.conf.example" "${SCRIPT_DIR}/config/backup.conf"
+    fi
+
     # MySQL settings
     if [ "$ENABLE_MYSQL" = true ]; then
         echo ""
@@ -589,6 +612,14 @@ run_config_wizard() {
         read -p "MySQL data directory on host [/opt/oempro/_dockerfiles/mysql/data_v8]: " mysql_data_dir
         mysql_data_dir=${mysql_data_dir:-/opt/oempro/_dockerfiles/mysql/data_v8}
         sed -i "s|^MYSQL_DATA_DIR=.*|MYSQL_DATA_DIR=$mysql_data_dir|" "$env_file"
+
+        echo ""
+        log_info "Binary logs: only needed if binary logging is enabled AND the binlogs"
+        log_info "live OUTSIDE the data directory (e.g. a sibling log_v8/). Leave empty otherwise."
+        read -p "MySQL binary log basename on host (optional) []: " mysql_log_bin
+        if [ -n "$mysql_log_bin" ]; then
+            sed -i "s|^MYSQL_LOG_BIN=.*|MYSQL_LOG_BIN=$mysql_log_bin|" "$env_file"
+        fi
     fi
 
     # ClickHouse settings
@@ -677,10 +708,31 @@ run_config_wizard() {
                 sed -i "s|^R2_SECRET_ACCESS_KEY=.*|R2_SECRET_ACCESS_KEY=$r2_secret_key|" "$env_file"
                 ;;
         esac
+
+        # No-local retention: delete the local copy after a successful upload
+        echo ""
+        log_info "No-local mode deletes the local backup right after a successful cloud"
+        log_info "upload (so the disk only holds it transiently). Recommended for large DBs."
+        read -p "Delete local backups after upload (KEEP_LOCAL_BACKUP=false)? (y/n) [n]: " no_local
+        if [ "$no_local" = "y" ] || [ "$no_local" = "Y" ]; then
+            sed -i "s/^KEEP_LOCAL_BACKUP=.*/KEEP_LOCAL_BACKUP=false/" "$env_file"
+            log_info "Set KEEP_LOCAL_BACKUP=false (local copies removed after upload)"
+        fi
     fi
 
     echo ""
     log_success "Configuration saved to $env_file"
+
+    # Offer to validate cloud connectivity now (write/read/delete cycle)
+    if [ "${enable_cloud:-n}" = "y" ] || [ "${enable_cloud:-n}" = "Y" ]; then
+        echo ""
+        read -p "Test cloud storage connectivity now? (y/n) [y]: " test_storage
+        test_storage=${test_storage:-y}
+        if [ "$test_storage" = "y" ] || [ "$test_storage" = "Y" ]; then
+            "${SCRIPT_DIR}/bin/octeth-test-storage.sh" -v || \
+                log_warn "Storage test reported issues — review the output above before relying on backups"
+        fi
+    fi
 }
 
 # ============================================
